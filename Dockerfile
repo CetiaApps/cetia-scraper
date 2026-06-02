@@ -2,14 +2,16 @@ FROM mcr.microsoft.com/playwright:v1.48.2-jammy
 
 WORKDIR /app
 
-COPY package*.json ./
+RUN corepack enable
 
-RUN npm install --no-audit --no-fund --legacy-peer-deps
+COPY package.json pnpm-lock.yaml* ./
+
+RUN pnpm install --frozen-lockfile=false
 
 COPY . .
 
-RUN npm run build
+RUN pnpm run build
 
 EXPOSE 3000
 
-CMD ["npm", "start"]
+CMD ["pnpm", "start"]
