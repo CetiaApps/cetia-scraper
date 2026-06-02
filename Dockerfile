@@ -2,11 +2,11 @@ FROM mcr.microsoft.com/playwright:v1.48.2-jammy
 
 WORKDIR /app
 
-RUN corepack enable
+RUN npm install -g pnpm
 
-COPY package.json pnpm-lock.yaml* ./
+COPY package.json ./
 
-RUN pnpm install --frozen-lockfile=false
+RUN pnpm install --no-frozen-lockfile
 
 COPY . .
 
