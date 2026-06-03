@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 dotenv.config();
 import { brightdataTestRouter } from './routes/brightdataTest.js';
+import { tescoBrightdataTestRouter } from './routes/tescoBrightdataTest.js';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { healthRouter } from './routes/health.js';
 import { scrapeRouter } from './routes/scrape.js';
@@ -28,6 +29,7 @@ export function requireApiKey(req: Request, res: Response, next: NextFunction): 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(brightdataTestRouter);
+app.use(tescoBrightdataTestRouter);
 app.use(healthRouter);
 app.use(scrapeRouter);
 app.use(jobsRouter);
