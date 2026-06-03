@@ -16,20 +16,20 @@ function getPositiveIntegerFromEnv(name: string, fallback: number): number {
 scrapeRouter.post('/scrape/tesco', requireApiKey, (req, res) => {
   const body = req.body as ScrapeRequestBody;
   const queries = body.queries ?? ['baked beans', 'whole milk', 'sourdough'];
-  const maxResultsPerQuery = body.maxResultsPerQuery ?? 10;
+  const maxResultsPerQuery = body.maxResultsPerQuery ?? 200;
 
   if (!Array.isArray(queries) || !queries.length || queries.some((query) => typeof query !== 'string' || !query.trim())) {
     res.status(400).json({ success: false, error: 'queries must be a non-empty string array' });
     return;
   }
 
-  if (!Number.isFinite(maxResultsPerQuery) || maxResultsPerQuery < 1 || maxResultsPerQuery > 50) {
-    res.status(400).json({ success: false, error: 'maxResultsPerQuery must be between 1 and 50' });
+  if (!Number.isFinite(maxResultsPerQuery) || maxResultsPerQuery < 1 || maxResultsPerQuery > 200) {
+    res.status(400).json({ success: false, error: 'maxResultsPerQuery must be between 1 and 200' });
     return;
   }
 
   const cleanQueries = queries.map((query) => query.trim()).filter(Boolean);
-  const maxTescoQueries = getPositiveIntegerFromEnv('MAX_TESCO_QUERIES', 1);
+  const maxTescoQueries = getPositiveIntegerFromEnv('MAX_TESCO_QUERIES', 200);
   const limitedQueries = cleanQueries.slice(0, maxTescoQueries);
 
   console.log('[scrape/tesco] Prepared Tesco job', {
