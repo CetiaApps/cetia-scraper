@@ -1,6 +1,6 @@
 import dotenv from 'dotenv';
 dotenv.config();
-
+import { brightdataTestRouter } from './routes/brightdataTest.js';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { healthRouter } from './routes/health.js';
 import { scrapeRouter } from './routes/scrape.js';
