@@ -2,64 +2,85 @@ import { Router } from 'express';
 
 export const tescoBrightdataExtractTestRouter = Router();
 
-function extractTescoProductsFromHtml(html: string) {
-  const products: Array<{
-    title: string | null;
-    priceText: string | null;
-  }> = [];
+tescoBrightdataExtractTestRouter.get(
+  '/test/brightdata/tesco/extract',
+  async (_req, res) => {
+    const apiKey = process.env.BRIGHTDATA_API_KEY;
+    const zone = process.env.BRIGHTDATA_ZONE || 'cetiadataservice';
 
-  const text = html;
+    if (!apiKey) {
+      return res.status(500).json({
+        success: false,
+        error: 'BRIGHTDATA_API_KEY is missing',
+      });
+    }
 
-  const titleMatches = [...text.matchAll(/"title"\s*:\s*"([^"]+)"/g)];
-  const priceMatches = [...text.matchAll(/"price"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?/g)];
+    try {
+      const tescoUrl =
+        'https://www.tesco.com/groceries/en-GB/search?query=Baby%20Bottles';
 
-  const max = Math.min(titleMatches.length, priceMatches.length, 20);
+      const response = await fetch('https://api.brightdata.com/request', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          zone,
+          url: tescoUrl,
+          format: 'raw',
+        }),
+      });
 
-  for (let i = 0; i < max; i += 1) {
-    products.push({
-      title: titleMatches[i]?.[1] ?? null,
-      priceText: priceMatches[i]?.[1] ? `£${priceMatches[i][1]}` : null,
-    });
-  }
+      const html = await response.text();
 
-  return products;
-}
+      const markers = [
+        'product-tile',
+        'productTitle',
+        'product-title',
+        'product_name',
+        'productName',
+        'price',
+        'actualPrice',
+        'unitPrice',
+        'Baby Bottles',
+        '__NEXT_DATA__',
+        'mfe-plp',
+        'apollo',
+        'graphql',
+      ];
 
-tescoBrightdataExtractTestRouter.get('/test/brightdata/tesco/extract', async (_req, res) => {
-  const apiKey = process.env.BRIGHTDATA_API_KEY;
-  const zone = process.env.BRIGHTDATA_ZONE || 'cetiadataservice';
+      const markerResults = markers.map((marker) => {
+        const index = html.indexOf(marker);
 
-  if (!apiKey) {
-    return res.status(500).json({
-      success: false,
-      error: 'BRIGHTDATA_API_KEY is missing',
-    });
-  }
+        return {
+          marker,
+          found: index >= 0,
+          index,
+          sample:
+            index >= 0
+              ? html.slice(
+                  Math.max(0, index - 500),
+                  index + 1500,
+                )
+              : null,
+        };
+      });
 
-  const tescoUrl =
-    'https://www.tesco.com/groceries/en-GB/search?query=Baby%20Bottles';
-
-  const response = await fetch('https://api.brightdata.com/request', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      zone,
-      url: tescoUrl,
-      format: 'raw',
-    }),
-  });
-
-  const html = await response.text();
-  const products = extractTescoProductsFromHtml(html);
-
-  return res.status(200).json({
-    success: response.ok,
-    brightDataStatus: response.status,
-    bodyLength: html.length,
-    productCount: products.length,
-    products,
-  });
-});
+      return res.status(200).json({
+        success: response.ok,
+        brightDataStatus: response.status,
+        bodyLength: html.length,
+        markerResults,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Unknown error',
+      });
+    }
+  },
+);
