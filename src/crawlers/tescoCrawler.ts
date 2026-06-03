@@ -9,7 +9,10 @@ interface TescoUserData {
   maxResultsPerQuery: number;
 }
 
-export async function scrapeTesco(queries: string[], maxResultsPerQuery: number): Promise<ScrapedProduct[]> {
+export async function scrapeTesco(
+  queries: string[],
+  maxResultsPerQuery: number,
+): Promise<ScrapedProduct[]> {
   const results: ScrapedProduct[] = [];
 
   const startUrls = queries.map((query) => ({
@@ -24,29 +27,91 @@ export async function scrapeTesco(queries: string[], maxResultsPerQuery: number)
   });
 
   const crawler = new PlaywrightCrawler({
-    maxConcurrency: Number(process.env.MAX_CONCURRENCY || 2),
+    maxConcurrency: Number(process.env.MAX_CONCURRENCY || 1),
     useSessionPool: true,
     persistCookiesPerSession: true,
     retryOnBlocked: true,
     maxRequestRetries: 3,
     requestHandlerTimeoutSecs: 120,
     navigationTimeoutSecs: 60,
+
     launchContext: {
       launchOptions: {
         headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-blink-features=AutomationControlled',
+        ],
       },
     },
+
+    preNavigationHooks: [
+      async ({ page }) => {
+        await page.setExtraHTTPHeaders({
+          'Accept-Language': 'en-GB,en;q=0.9',
+          Accept:
+            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+          'Upgrade-Insecure-Requests': '1',
+        });
+
+        await page.setViewportSize({
+          width: 1366,
+          height: 768,
+        });
+      },
+    ],
+
     async requestHandler({ page, request, log }) {
       const { query, maxResultsPerQuery: limit } = request.userData as TescoUserData;
+
       log.info(`Scraping Tesco query: ${query}`);
+
+      await page.waitForLoadState('domcontentloaded').catch(() => undefined);
+      await page.waitForTimeout(2000);
+
+      const currentUrl = page.url();
+      const title = await page.title().catch(() => null);
+      const bodyText = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
+
+      console.log('[tescoCrawler] Page loaded', {
+        query,
+        requestedUrl: request.url,
+        currentUrl,
+        title,
+        bodyPreview: normaliseWhitespace(bodyText)?.slice(0, 500),
+      });
+
+      if (/access denied|forbidden|blocked|captcha|robot|verify/i.test(bodyText || '')) {
+        console.warn('[tescoCrawler] Possible Tesco block/challenge page', {
+          query,
+          requestedUrl: request.url,
+          currentUrl,
+          title,
+          bodyPreview: normaliseWhitespace(bodyText)?.slice(0, 1000),
+        });
+      }
 
       await handleCookieBanner(page);
       await page.waitForLoadState('networkidle').catch(() => undefined);
       await page.waitForTimeout(3000);
 
       const products = await extractProducts(page, query, limit);
+
+      console.log('[tescoCrawler] Extracted products', {
+        query,
+        count: products.length,
+      });
+
       results.push(...products);
+    },
+
+    failedRequestHandler({ request, error, log }) {
+      log.error(`Tesco request failed: ${request.url}`, {
+        errorMessage: error instanceof Error ? error.message : String(error),
+        retryCount: request.retryCount,
+      });
     },
   });
 
@@ -61,10 +126,19 @@ export async function scrapeTesco(queries: string[], maxResultsPerQuery: number)
 }
 
 async function handleCookieBanner(page: Page): Promise<void> {
-  const buttonNames = ['Accept All', 'Accept all', 'Accept', 'Allow All', 'Allow all'];
+  const buttonNames = [
+    'Accept All',
+    'Accept all',
+    'Accept',
+    'Allow All',
+    'Allow all',
+    'I agree',
+    'Agree',
+  ];
 
   for (const name of buttonNames) {
     const button = page.getByRole('button', { name, exact: false }).first();
+
     try {
       if (await button.isVisible({ timeout: 1500 })) {
         await button.click({ timeout: 1500 });
@@ -77,7 +151,11 @@ async function handleCookieBanner(page: Page): Promise<void> {
   }
 }
 
-async function extractProducts(page: Page, query: string, maxResults: number): Promise<ScrapedProduct[]> {
+async function extractProducts(
+  page: Page,
+  query: string,
+  maxResults: number,
+): Promise<ScrapedProduct[]> {
   const productSelectors = [
     '[data-auto="product-tile"]',
     '[data-testid="product-tile"]',
@@ -88,6 +166,7 @@ async function extractProducts(page: Page, query: string, maxResults: number): P
 
   for (const selector of productSelectors) {
     const count = await page.locator(selector).count().catch(() => 0);
+
     if (count > 0) {
       const products: ScrapedProduct[] = [];
       const max = Math.min(count, maxResults);
@@ -95,7 +174,12 @@ async function extractProducts(page: Page, query: string, maxResults: number): P
       for (let index = 0; index < max; index += 1) {
         const card = page.locator(selector).nth(index);
         const text = normaliseWhitespace(await card.innerText({ timeout: 5000 }).catch(() => ''));
-        const href = await card.locator('a[href*="/products/"]').first().getAttribute('href').catch(() => null);
+        const href = await card
+          .locator('a[href*="/products/"]')
+          .first()
+          .getAttribute('href')
+          .catch(() => null);
+
         const title = await extractTitle(card, text);
         const priceText = extractPriceText(text);
         const unitPrice = extractUnitPrice(text);
@@ -128,7 +212,15 @@ async function extractProducts(page: Page, query: string, maxResults: number): P
           category_path: null,
           rating: extractRating(text),
           review_count: extractReviewCount(text),
-          raw_data: removeImageFields({ query, position: index + 1, title, priceText, unitPrice, href, text }) as Record<string, unknown>,
+          raw_data: removeImageFields({
+            query,
+            position: index + 1,
+            title,
+            priceText,
+            unitPrice,
+            href,
+            text,
+          }) as Record<string, unknown>,
         });
       }
 
@@ -139,7 +231,10 @@ async function extractProducts(page: Page, query: string, maxResults: number): P
   return extractFromJsonLdOrScripts(page, query, maxResults);
 }
 
-async function extractTitle(card: ReturnType<Page['locator']>, fallbackText: string | null): Promise<string | null> {
+async function extractTitle(
+  card: ReturnType<Page['locator']>,
+  fallbackText: string | null,
+): Promise<string | null> {
   const candidates = [
     'h3',
     'h2',
@@ -149,61 +244,89 @@ async function extractTitle(card: ReturnType<Page['locator']>, fallbackText: str
   ];
 
   for (const selector of candidates) {
-    const value = normaliseWhitespace(await card.locator(selector).first().innerText({ timeout: 1000 }).catch(() => ''));
+    const value = normaliseWhitespace(
+      await card.locator(selector).first().innerText({ timeout: 1000 }).catch(() => ''),
+    );
+
     if (value) return value;
   }
 
-  return fallbackText?.split('\n').map((line) => line.trim()).find(Boolean) ?? null;
+  return fallbackText
+    ?.split('\n')
+    .map((line) => line.trim())
+    .find(Boolean) ?? null;
 }
 
 function extractPriceText(text: string | null): string | null {
   if (!text) return null;
+
   const match = text.match(/£\s?\d+(?:\.\d{1,2})?|\d+p\b/i);
   return match ? match[0].replace(/\s+/g, '') : null;
 }
 
 function extractUnitPrice(text: string | null): string | null {
   if (!text) return null;
-  const match = text.match(/(?:£\s?\d+(?:\.\d{1,2})?|\d+p)\s?\/?\s?(?:kg|g|l|litre|100g|100ml|each|pack)/i);
+
+  const match = text.match(
+    /(?:£\s?\d+(?:\.\d{1,2})?|\d+p)\s?\/?\s?(?:kg|g|l|litre|100g|100ml|each|pack)/i,
+  );
+
   return match ? normaliseWhitespace(match[0]) : null;
 }
 
 function extractUnitPriceUnit(unitPrice: string | null): string | null {
   if (!unitPrice) return null;
+
   const match = unitPrice.match(/(?:kg|g|l|litre|100g|100ml|each|pack)$/i);
   return match ? match[0] : null;
 }
 
 function extractOfferText(text: string | null): string | null {
   if (!text) return null;
-  const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
+
+  const lines = text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
   return lines.find((line) => /clubcard|offer|save|buy|deal|was/i.test(line)) ?? null;
 }
 
 function extractProductId(href: string | null): string | null {
   if (!href) return null;
+
   const match = href.match(/products\/(\d+)/);
   return match?.[1] ?? null;
 }
 
 function extractRating(text: string | null): number | null {
   if (!text) return null;
+
   const match = text.match(/(\d(?:\.\d)?)\s*(?:out of|\/)?\s*5/i);
   return match ? toNumber(match[1]) : null;
 }
 
 function extractReviewCount(text: string | null): number | null {
   if (!text) return null;
+
   const match = text.match(/(\d+)\s*(?:reviews?|ratings?)/i);
   return match ? toNumber(match[1]) : null;
 }
 
-async function extractFromJsonLdOrScripts(page: Page, query: string, maxResults: number): Promise<ScrapedProduct[]> {
-  const scriptTexts = await page.locator('script').evaluateAll((scripts) => scripts.map((script) => script.textContent || ''));
+async function extractFromJsonLdOrScripts(
+  page: Page,
+  query: string,
+  maxResults: number,
+): Promise<ScrapedProduct[]> {
+  const scriptTexts = await page
+    .locator('script')
+    .evaluateAll((scripts) => scripts.map((script) => script.textContent || ''));
+
   const joined = scriptTexts.join('\n');
 
   const products: ScrapedProduct[] = [];
   const regex = /"title"\s*:\s*"([^"]+)"[\s\S]{0,500}?"price"\s*:\s*"?([0-9.]+)"?/g;
+
   let match: RegExpExecArray | null;
 
   while ((match = regex.exec(joined)) && products.length < maxResults) {
