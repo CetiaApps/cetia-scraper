@@ -27,7 +27,7 @@ export function requireApiKey(req: Request, res: Response, next: NextFunction): 
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
-
+app.use(brightdataTestRouter);
 app.use(healthRouter);
 app.use(scrapeRouter);
 app.use(jobsRouter);
