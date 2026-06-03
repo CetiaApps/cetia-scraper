@@ -3,20 +3,19 @@
   "version": "1.0.0",
   "description": "Cetia supermarket scraper service for Railway using Express, Crawlee and PlaywrightCrawler.",
   "main": "dist/index.js",
-"scripts": {
-  "dev": "tsx watch src/index.ts",
-  "postinstall": "npx playwright install --with-deps chromium",
-  "build": "tsc",
-  "start": "node dist/index.js",
-  "type-check": "tsc --noEmit"
-},
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "type-check": "tsc --noEmit"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",
     "crawlee": "^3.11.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "nanoid": "^3.3.8",
-    "playwright": "^1.47.2"
+    "playwright": "1.60.0"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
@@ -27,5 +26,4 @@
   "engines": {
     "node": ">=20"
   }
-  
 }

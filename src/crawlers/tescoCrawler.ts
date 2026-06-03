@@ -9,6 +9,11 @@ interface TescoUserData {
   maxResultsPerQuery: number;
 }
 
+function getPositiveIntegerFromEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
 export async function scrapeTesco(
   queries: string[],
   maxResultsPerQuery: number,
@@ -23,11 +28,12 @@ export async function scrapeTesco(
   console.log('[tescoCrawler] Starting Tesco crawl', {
     queryCount: queries.length,
     startUrlCount: startUrls.length,
+    maxConcurrency: getPositiveIntegerFromEnv('MAX_CONCURRENCY', 1),
     sampleUrls: startUrls.slice(0, 3).map((request) => request.url),
   });
 
   const crawler = new PlaywrightCrawler({
-    maxConcurrency: Number(process.env.MAX_CONCURRENCY || 1),
+    maxConcurrency: getPositiveIntegerFromEnv('MAX_CONCURRENCY', 1),
     useSessionPool: true,
     persistCookiesPerSession: true,
     retryOnBlocked: true,
@@ -74,13 +80,14 @@ export async function scrapeTesco(
       const currentUrl = page.url();
       const title = await page.title().catch(() => null);
       const bodyText = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
+      const bodyPreview = normaliseWhitespace(bodyText)?.slice(0, 500);
 
       console.log('[tescoCrawler] Page loaded', {
         query,
         requestedUrl: request.url,
         currentUrl,
         title,
-        bodyPreview: normaliseWhitespace(bodyText)?.slice(0, 500),
+        bodyPreview,
       });
 
       if (/access denied|forbidden|blocked|captcha|robot|verify/i.test(bodyText || '')) {
