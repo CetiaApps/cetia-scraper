@@ -30,9 +30,10 @@ export async function scrapeTesco(queries: string[], maxResultsPerQuery: number)
     requestHandlerTimeoutSecs: 120,
     navigationTimeoutSecs: 60,
     launchContext: {
-      launchOptions: {
-        headless: true,
-      },
+launchOptions: {
+  headless: true,
+  args: ["--no-sandbox", "--disable-setuid-sandbox"],
+},
     },
     async requestHandler({ page, request, log }) {
       const { query, maxResultsPerQuery: limit } = request.userData as TescoUserData;
