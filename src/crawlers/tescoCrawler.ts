@@ -31,7 +31,7 @@ export async function scrapeTesco(
     useSessionPool: true,
     persistCookiesPerSession: true,
     retryOnBlocked: true,
-    maxRequestRetries: 3,
+    maxRequestRetries: 1,
     requestHandlerTimeoutSecs: 120,
     navigationTimeoutSecs: 60,
 
