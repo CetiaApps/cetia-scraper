@@ -5,12 +5,14 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-COPY package.json package-lock.json ./
-RUN npm install
+RUN npm install -g pnpm
+
+COPY package.json ./
+RUN pnpm install --no-frozen-lockfile
 
 COPY . .
-RUN npm run build
+RUN pnpm run build
 
 EXPOSE 3000
 
-CMD ["npm", "start"]
+CMD ["pnpm", "start"]
