@@ -14,6 +14,12 @@ export function createSupabaseServiceClient() {
       autoRefreshToken: false,
     },
   });
+  const payload = JSON.parse(
+  Buffer.from(serviceRoleKey.split('.')[1], 'base64url').toString('utf8')
+);
+
+console.log('[supabase] key role:', payload.role);
+console.log('[supabase] project url:', supabaseUrl);
 }
 
 export async function insertProductScrappedRows(rows: ProductScrappedRow[], batchSize = 500): Promise<number> {
