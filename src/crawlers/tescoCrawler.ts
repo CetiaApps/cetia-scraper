@@ -1,4 +1,4 @@
-import { PlaywrightCrawler, RequestQueue } from 'crawlee';
+import { PlaywrightCrawler } from 'crawlee';
 import type { Page } from 'playwright';
 import type { ScrapedProduct } from '../types.js';
 import { absoluteTescoUrl, normaliseWhitespace, toNumber } from '../utils/normalise.js';
@@ -11,17 +11,19 @@ interface TescoUserData {
 
 export async function scrapeTesco(queries: string[], maxResultsPerQuery: number): Promise<ScrapedProduct[]> {
   const results: ScrapedProduct[] = [];
-  const requestQueue = await RequestQueue.open();
 
-  for (const query of queries) {
-    await requestQueue.addRequest({
-      url: `https://www.tesco.com/groceries/en-GB/search?query=${encodeURIComponent(query)}`,
-      userData: { query, maxResultsPerQuery } satisfies TescoUserData,
-    });
-  }
+  const startUrls = queries.map((query) => ({
+    url: `https://www.tesco.com/groceries/en-GB/search?query=${encodeURIComponent(query)}`,
+    userData: { query, maxResultsPerQuery } satisfies TescoUserData,
+  }));
+
+  console.log('[tescoCrawler] Starting Tesco crawl', {
+    queryCount: queries.length,
+    startUrlCount: startUrls.length,
+    sampleUrls: startUrls.slice(0, 3).map((request) => request.url),
+  });
 
   const crawler = new PlaywrightCrawler({
-    requestQueue,
     maxConcurrency: Number(process.env.MAX_CONCURRENCY || 2),
     useSessionPool: true,
     persistCookiesPerSession: true,
@@ -30,10 +32,10 @@ export async function scrapeTesco(queries: string[], maxResultsPerQuery: number)
     requestHandlerTimeoutSecs: 120,
     navigationTimeoutSecs: 60,
     launchContext: {
-launchOptions: {
-  headless: true,
-  args: ["--no-sandbox", "--disable-setuid-sandbox"],
-},
+      launchOptions: {
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      },
     },
     async requestHandler({ page, request, log }) {
       const { query, maxResultsPerQuery: limit } = request.userData as TescoUserData;
@@ -48,7 +50,13 @@ launchOptions: {
     },
   });
 
-  await crawler.run();
+  await crawler.run(startUrls);
+
+  console.log('[tescoCrawler] Tesco crawl finished', {
+    queryCount: queries.length,
+    resultCount: results.length,
+  });
+
   return results;
 }
 
