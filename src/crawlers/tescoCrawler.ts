@@ -1,12 +1,38 @@
-import { PlaywrightCrawler } from 'crawlee';
-import type { Page } from 'playwright';
 import type { ScrapedProduct } from '../types.js';
 import { absoluteTescoUrl, normaliseWhitespace, toNumber } from '../utils/normalise.js';
 import { removeImageFields } from '../utils/removeImages.js';
 
-interface TescoUserData {
-  query: string;
-  maxResultsPerQuery: number;
+interface TescoProductRecord {
+  id?: string;
+  tpnb?: string;
+  tpnc?: string;
+  gtin?: string;
+  title?: string;
+  brandName?: string;
+  defaultImageUrl?: string;
+  shortDescription?: string | null;
+  status?: string;
+  isForSale?: boolean;
+  price?: {
+    actual?: number;
+    unitPrice?: number;
+    unitOfMeasure?: string;
+  };
+  promotions?: Array<{
+    promotionText?: string;
+    offerText?: string;
+    description?: string;
+  }>;
+}
+
+function getRequiredEnv(name: string): string {
+  const value = process.env[name];
+
+  if (!value) {
+    throw new Error(`${name} is missing`);
+  }
+
+  return value;
 }
 
 function getPositiveIntegerFromEnv(name: string, fallback: number): number {
@@ -20,111 +46,25 @@ export async function scrapeTesco(
 ): Promise<ScrapedProduct[]> {
   const results: ScrapedProduct[] = [];
 
-  const startUrls = queries.map((query) => ({
-    url: `https://www.tesco.com/groceries/en-GB/search?query=${encodeURIComponent(query)}`,
-    userData: { query, maxResultsPerQuery } satisfies TescoUserData,
-  }));
-
-  console.log('[tescoCrawler] Starting Tesco crawl', {
+  console.log('[tescoCrawler] Starting Bright Data Tesco scrape', {
     queryCount: queries.length,
-    startUrlCount: startUrls.length,
-    maxConcurrency: getPositiveIntegerFromEnv('MAX_CONCURRENCY', 1),
-    sampleUrls: startUrls.slice(0, 3).map((request) => request.url),
+    maxResultsPerQuery,
+    querySample: queries.slice(0, 3),
   });
 
-  const crawler = new PlaywrightCrawler({
-    maxConcurrency: getPositiveIntegerFromEnv('MAX_CONCURRENCY', 1),
-    useSessionPool: true,
-    persistCookiesPerSession: true,
-    retryOnBlocked: true,
-    maxRequestRetries: 1,
-    requestHandlerTimeoutSecs: 120,
-    navigationTimeoutSecs: 60,
+  for (const query of queries) {
+    const html = await fetchTescoHtml(query);
+    const products = extractTescoProductsFromHtml(html, query, maxResultsPerQuery);
 
-    launchContext: {
-      launchOptions: {
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-blink-features=AutomationControlled',
-        ],
-      },
-    },
+    console.log('[tescoCrawler] Extracted Tesco products', {
+      query,
+      count: products.length,
+    });
 
-    preNavigationHooks: [
-      async ({ page }) => {
-        await page.setExtraHTTPHeaders({
-          'Accept-Language': 'en-GB,en;q=0.9',
-          Accept:
-            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-          'Upgrade-Insecure-Requests': '1',
-        });
+    results.push(...products);
+  }
 
-        await page.setViewportSize({
-          width: 1366,
-          height: 768,
-        });
-      },
-    ],
-
-    async requestHandler({ page, request, log }) {
-      const { query, maxResultsPerQuery: limit } = request.userData as TescoUserData;
-
-      log.info(`Scraping Tesco query: ${query}`);
-
-      await page.waitForLoadState('domcontentloaded').catch(() => undefined);
-      await page.waitForTimeout(2000);
-
-      const currentUrl = page.url();
-      const title = await page.title().catch(() => null);
-      const bodyText = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
-      const bodyPreview = normaliseWhitespace(bodyText)?.slice(0, 500);
-
-      console.log('[tescoCrawler] Page loaded', {
-        query,
-        requestedUrl: request.url,
-        currentUrl,
-        title,
-        bodyPreview,
-      });
-
-      if (/access denied|forbidden|blocked|captcha|robot|verify/i.test(bodyText || '')) {
-        console.warn('[tescoCrawler] Possible Tesco block/challenge page', {
-          query,
-          requestedUrl: request.url,
-          currentUrl,
-          title,
-          bodyPreview: normaliseWhitespace(bodyText)?.slice(0, 1000),
-        });
-      }
-
-      await handleCookieBanner(page);
-      await page.waitForLoadState('networkidle').catch(() => undefined);
-      await page.waitForTimeout(3000);
-
-      const products = await extractProducts(page, query, limit);
-
-      console.log('[tescoCrawler] Extracted products', {
-        query,
-        count: products.length,
-      });
-
-      results.push(...products);
-    },
-
-    failedRequestHandler({ request, error, log }) {
-      log.error(`Tesco request failed: ${request.url}`, {
-        errorMessage: error instanceof Error ? error.message : String(error),
-        retryCount: request.retryCount,
-      });
-    },
-  });
-
-  await crawler.run(startUrls);
-
-  console.log('[tescoCrawler] Tesco crawl finished', {
+  console.log('[tescoCrawler] Tesco scrape finished', {
     queryCount: queries.length,
     resultCount: results.length,
   });
@@ -132,245 +72,186 @@ export async function scrapeTesco(
   return results;
 }
 
-async function handleCookieBanner(page: Page): Promise<void> {
-  const buttonNames = [
-    'Accept All',
-    'Accept all',
-    'Accept',
-    'Allow All',
-    'Allow all',
-    'I agree',
-    'Agree',
-  ];
+async function fetchTescoHtml(query: string): Promise<string> {
+  const apiKey = getRequiredEnv('BRIGHTDATA_API_KEY');
+  const zone = process.env.BRIGHTDATA_ZONE || 'cetiadataservice';
 
-  for (const name of buttonNames) {
-    const button = page.getByRole('button', { name, exact: false }).first();
+  const url = `https://www.tesco.com/groceries/en-GB/search?query=${encodeURIComponent(query)}`;
 
-    try {
-      if (await button.isVisible({ timeout: 1500 })) {
-        await button.click({ timeout: 1500 });
-        await page.waitForTimeout(1000);
-        return;
-      }
-    } catch {
-      // Ignore missing cookie banner/buttons.
-    }
+  console.log('[tescoCrawler] Bright Data request', {
+    zone,
+    url,
+  });
+
+  const response = await fetch('https://api.brightdata.com/request', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      zone,
+      url,
+      format: 'raw',
+    }),
+  });
+
+  const body = await response.text();
+
+  console.log('[tescoCrawler] Bright Data response', {
+    status: response.status,
+    ok: response.ok,
+    bodyLength: body.length,
+  });
+
+  if (!response.ok) {
+    throw new Error(`Bright Data request failed with status ${response.status}: ${body.slice(0, 500)}`);
   }
+
+  return body;
 }
 
-async function extractProducts(
-  page: Page,
+function extractTescoProductsFromHtml(
+  html: string,
   query: string,
   maxResults: number,
-): Promise<ScrapedProduct[]> {
-  const productSelectors = [
-    '[data-auto="product-tile"]',
-    '[data-testid="product-tile"]',
-    '[data-test="product-tile"]',
-    'li:has(a[href*="/products/"])',
-    'div:has(a[href*="/products/"])',
-  ];
+): ScrapedProduct[] {
+  const productRecords = extractProductRecords(html);
+  const limit = Math.min(productRecords.length, getPositiveIntegerFromEnv('MAX_RESULTS_PER_QUERY', maxResults));
 
-  for (const selector of productSelectors) {
-    const count = await page.locator(selector).count().catch(() => 0);
+  return productRecords.slice(0, limit).map((product, index) => {
+    const priceText = typeof product.price?.actual === 'number'
+      ? `£${product.price.actual.toFixed(2)}`
+      : null;
 
-    if (count > 0) {
-      const products: ScrapedProduct[] = [];
-      const max = Math.min(count, maxResults);
+    const unitPrice = typeof product.price?.unitPrice === 'number'
+      ? `£${product.price.unitPrice.toFixed(2)}/${product.price.unitOfMeasure || ''}`.replace(/\/$/, '')
+      : null;
 
-      for (let index = 0; index < max; index += 1) {
-        const card = page.locator(selector).nth(index);
-        const text = normaliseWhitespace(await card.innerText({ timeout: 5000 }).catch(() => ''));
-        const href = await card
-          .locator('a[href*="/products/"]')
-          .first()
-          .getAttribute('href')
-          .catch(() => null);
+    const href = product.tpnc
+      ? `https://www.tesco.com/shop/en-GB/products/${product.tpnc}`
+      : null;
 
-        const title = await extractTitle(card, text);
-        const priceText = extractPriceText(text);
-        const unitPrice = extractUnitPrice(text);
+    const promotionText =
+      product.promotions?.[0]?.promotionText ||
+      product.promotions?.[0]?.offerText ||
+      product.promotions?.[0]?.description ||
+      null;
 
-        products.push({
-          query,
-          position: index + 1,
-          supermarket_name: 'Tesco',
-          supermarket_code: 'tesco',
-          product_name: title,
-          product_title: title,
-          brand: null,
-          description: text,
-          price: toNumber(priceText),
-          price_text: priceText,
-          currency: 'GBP',
-          unit_price: unitPrice,
-          unit_price_value: toNumber(unitPrice),
-          unit_price_unit: extractUnitPriceUnit(unitPrice),
-          offer_text: extractOfferText(text),
-          promotion_text: extractOfferText(text),
-          availability: null,
-          in_stock: text ? !/out of stock|unavailable/i.test(text) : null,
-          product_url: absoluteTescoUrl(href),
-          product_id: extractProductId(href),
-          sku: null,
-          gtin: null,
-          barcode: null,
-          category: null,
-          category_path: null,
-          rating: extractRating(text),
-          review_count: extractReviewCount(text),
-          raw_data: removeImageFields({
-            query,
-            position: index + 1,
-            title,
-            priceText,
-            unitPrice,
-            href,
-            text,
-          }) as Record<string, unknown>,
-        });
-      }
-
-      if (products.length) return products;
-    }
-  }
-
-  return extractFromJsonLdOrScripts(page, query, maxResults);
-}
-
-async function extractTitle(
-  card: ReturnType<Page['locator']>,
-  fallbackText: string | null,
-): Promise<string | null> {
-  const candidates = [
-    'h3',
-    'h2',
-    '[data-auto="product-tile--title"]',
-    '[data-testid="product-title"]',
-    'a[href*="/products/"]',
-  ];
-
-  for (const selector of candidates) {
-    const value = normaliseWhitespace(
-      await card.locator(selector).first().innerText({ timeout: 1000 }).catch(() => ''),
-    );
-
-    if (value) return value;
-  }
-
-  return fallbackText
-    ?.split('\n')
-    .map((line) => line.trim())
-    .find(Boolean) ?? null;
-}
-
-function extractPriceText(text: string | null): string | null {
-  if (!text) return null;
-
-  const match = text.match(/£\s?\d+(?:\.\d{1,2})?|\d+p\b/i);
-  return match ? match[0].replace(/\s+/g, '') : null;
-}
-
-function extractUnitPrice(text: string | null): string | null {
-  if (!text) return null;
-
-  const match = text.match(
-    /(?:£\s?\d+(?:\.\d{1,2})?|\d+p)\s?\/?\s?(?:kg|g|l|litre|100g|100ml|each|pack)/i,
-  );
-
-  return match ? normaliseWhitespace(match[0]) : null;
-}
-
-function extractUnitPriceUnit(unitPrice: string | null): string | null {
-  if (!unitPrice) return null;
-
-  const match = unitPrice.match(/(?:kg|g|l|litre|100g|100ml|each|pack)$/i);
-  return match ? match[0] : null;
-}
-
-function extractOfferText(text: string | null): string | null {
-  if (!text) return null;
-
-  const lines = text
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  return lines.find((line) => /clubcard|offer|save|buy|deal|was/i.test(line)) ?? null;
-}
-
-function extractProductId(href: string | null): string | null {
-  if (!href) return null;
-
-  const match = href.match(/products\/(\d+)/);
-  return match?.[1] ?? null;
-}
-
-function extractRating(text: string | null): number | null {
-  if (!text) return null;
-
-  const match = text.match(/(\d(?:\.\d)?)\s*(?:out of|\/)?\s*5/i);
-  return match ? toNumber(match[1]) : null;
-}
-
-function extractReviewCount(text: string | null): number | null {
-  if (!text) return null;
-
-  const match = text.match(/(\d+)\s*(?:reviews?|ratings?)/i);
-  return match ? toNumber(match[1]) : null;
-}
-
-async function extractFromJsonLdOrScripts(
-  page: Page,
-  query: string,
-  maxResults: number,
-): Promise<ScrapedProduct[]> {
-  const scriptTexts = await page
-    .locator('script')
-    .evaluateAll((scripts) => scripts.map((script) => script.textContent || ''));
-
-  const joined = scriptTexts.join('\n');
-
-  const products: ScrapedProduct[] = [];
-  const regex = /"title"\s*:\s*"([^"]+)"[\s\S]{0,500}?"price"\s*:\s*"?([0-9.]+)"?/g;
-
-  let match: RegExpExecArray | null;
-
-  while ((match = regex.exec(joined)) && products.length < maxResults) {
-    const title = normaliseWhitespace(match[1]);
-    const priceText = match[2] ? `£${match[2]}` : null;
-
-    products.push({
+    return {
       query,
-      position: products.length + 1,
+      position: index + 1,
       supermarket_name: 'Tesco',
       supermarket_code: 'tesco',
-      product_name: title,
-      product_title: title,
-      brand: null,
-      description: null,
+      product_name: product.title ?? null,
+      product_title: product.title ?? null,
+      brand: product.brandName ?? null,
+      description: product.shortDescription ?? product.title ?? null,
       price: toNumber(priceText),
       price_text: priceText,
       currency: 'GBP',
-      unit_price: null,
-      unit_price_value: null,
-      unit_price_unit: null,
-      offer_text: null,
-      promotion_text: null,
-      availability: null,
-      in_stock: null,
-      product_url: null,
-      product_id: null,
-      sku: null,
-      gtin: null,
-      barcode: null,
+      unit_price: unitPrice,
+      unit_price_value: product.price?.unitPrice ?? null,
+      unit_price_unit: product.price?.unitOfMeasure ?? null,
+      offer_text: promotionText,
+      promotion_text: promotionText,
+      availability: product.status ?? null,
+      in_stock:
+        typeof product.isForSale === 'boolean'
+          ? product.isForSale
+          : product.status
+            ? /available/i.test(product.status)
+            : null,
+      product_url: absoluteTescoUrl(href),
+      product_id: product.tpnc ?? product.id ?? null,
+      sku: product.tpnb ?? null,
+      gtin: product.gtin ?? null,
+      barcode: product.gtin ?? null,
       category: null,
       category_path: null,
       rating: null,
       review_count: null,
-      raw_data: removeImageFields({ query, title, priceText }) as Record<string, unknown>,
-    });
+      raw_data: removeImageFields({
+        query,
+        position: index + 1,
+        product,
+      }) as Record<string, unknown>,
+    };
+  });
+}
+
+function extractProductRecords(html: string): TescoProductRecord[] {
+  const records: TescoProductRecord[] = [];
+  const seen = new Set<string>();
+
+  const regex = /"ProductType:(\d+)":\s*(\{[\s\S]*?)(?=,"[A-Za-z]+Type:|\}\}\}|\}\]\}|<\/script>)/g;
+
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(html)) !== null) {
+    const productId = match[1];
+    const objectStart = match.index + `"ProductType:${productId}":`.length;
+    const objectText = extractBalancedJsonObject(html, objectStart);
+
+    if (!objectText) continue;
+
+    try {
+      const product = JSON.parse(objectText) as TescoProductRecord;
+
+      if (!product.title || seen.has(productId)) continue;
+
+      seen.add(productId);
+      records.push({
+        ...product,
+        id: product.id ?? productId,
+      });
+    } catch {
+      // Ignore malformed embedded product objects.
+    }
   }
 
-  return products;
+  return records;
+}
+
+function extractBalancedJsonObject(text: string, startIndex: number): string | null {
+  const firstBrace = text.indexOf('{', startIndex);
+
+  if (firstBrace < 0) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = firstBrace; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (char === '\\') {
+      escaped = true;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (char === '{') {
+      depth += 1;
+    } else if (char === '}') {
+      depth -= 1;
+
+      if (depth === 0) {
+        return text.slice(firstBrace, index + 1);
+      }
+    }
+  }
+
+  return null;
 }
