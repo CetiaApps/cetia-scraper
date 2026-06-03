@@ -1,5 +1,5 @@
 import { PlaywrightCrawler } from 'crawlee';
-import type { Page } from 'playwright'; 
+import type { Page } from 'playwright';
 import type { ScrapedProduct } from '../types.js';
 import { absoluteTescoUrl, normaliseWhitespace, toNumber } from '../utils/normalise.js';
 import { removeImageFields } from '../utils/removeImages.js';
