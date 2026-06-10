@@ -24,13 +24,41 @@ export async function insertProductScrappedRows(rows: ProductScrappedRow[], batc
 
   for (let i = 0; i < rows.length; i += batchSize) {
     const batch = rows.slice(i, i + batchSize);
+    console.log('[productscrapped] Inserting batch', {
+      batchStart: i,
+      batchSize: batch.length,
+      supermarket: batch[0]?.supermarket_code,
+      hasListItemContext: batch.some((row) => Boolean(row.list_item_id)),
+      listItemIds: Array.from(new Set(batch.map((row) => row.list_item_id).filter(Boolean))).slice(0, 5),
+      sample: batch.slice(0, 3).map((row) => ({
+        name: row.product_name,
+        price: row.price,
+        query: row.query,
+        list_item_id: row.list_item_id,
+        supermarket_item_id: row.supermarket_item_id,
+      })),
+    });
+
     const { error } = await supabase.from('productscrapped').insert(batch);
 
     if (error) {
+      console.error('[productscrapped] Supabase insert failed', {
+        batchStart: i,
+        batchSize: batch.length,
+        code: error.code,
+        details: error.details,
+        hint: error.hint,
+        message: error.message,
+      });
       throw new Error(`Supabase insert failed: ${error.message}`);
     }
 
     insertedCount += batch.length;
+    console.log('[productscrapped] Inserted batch', {
+      batchStart: i,
+      batchSize: batch.length,
+      insertedCount,
+    });
   }
 
   return insertedCount;

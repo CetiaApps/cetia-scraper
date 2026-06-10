@@ -119,9 +119,40 @@ async function runTescoJob(
       ...scrapeContext,
     }));
 
+    console.log('[scrape/tesco] Inserting productscrapped rows', {
+      jobId,
+      productCount: products.length,
+      rowCount: rows.length,
+      hasListItemContext: Boolean(scrapeContext.list_item_id),
+      listItemId: scrapeContext.list_item_id,
+      supermarketItemId: scrapeContext.supermarket_item_id,
+      normalizedName: scrapeContext.normalized_name,
+      sample: rows.slice(0, 5).map((row) => ({
+        name: row.product_name,
+        price: row.price,
+        query: row.query,
+        list_item_id: row.list_item_id,
+        supermarket_item_id: row.supermarket_item_id,
+      })),
+    });
+
     const insertedCount = await insertProductScrappedRows(rows);
+    console.log('[scrape/tesco] Job completed', {
+      jobId,
+      productsFound: products.length,
+      insertedCount,
+      hasListItemContext: Boolean(scrapeContext.list_item_id),
+      listItemId: scrapeContext.list_item_id,
+      supermarketItemId: scrapeContext.supermarket_item_id,
+      normalizedName: scrapeContext.normalized_name,
+      sample: products.slice(0, 5).map((p) => ({ name: p.product_name, price: p.price })),
+    });
     markJobSucceeded(jobId, products, insertedCount);
   } catch (error) {
+    console.error('[scrape/tesco] Job failed', {
+      jobId,
+      error: error instanceof Error ? error.message : String(error),
+    });
     markJobFailed(jobId, error);
   }
 }
