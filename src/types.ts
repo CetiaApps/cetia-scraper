@@ -14,6 +14,11 @@ export interface ScrapeJob {
 
 export interface ScrapeRequestBody {
   queries?: string[];
+  query?: string;
+  item_name?: string;
+  normalized_name?: string;
+  list_item_id?: string;
+  supermarket_item_id?: string;
   maxResultsPerQuery?: number;
 }
 
@@ -51,4 +56,7 @@ export interface ScrapedProduct {
 export interface ProductScrappedRow extends ScrapedProduct {
   scrappeddate: string;
   scraper_job_id: string;
+  list_item_id?: string;
+  supermarket_item_id?: string;
+  normalized_name?: string;
 }

@@ -8,18 +8,58 @@ import type { ProductScrappedRow, ScrapeRequestBody } from '../types.js';
 
 export const scrapeRouter = Router();
 
+interface ScrapeContext {
+  list_item_id?: string;
+  supermarket_item_id?: string;
+  normalized_name?: string;
+}
+
 function getPositiveIntegerFromEnv(name: string, fallback: number): number {
   const value = Number(process.env[name]);
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
-scrapeRouter.post('/scrape/tesco', requireApiKey, (req, res) => {
+function cleanOptionalString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const cleaned = value.trim();
+  return cleaned.length ? cleaned : undefined;
+}
+
+function normaliseMetadataName(value: string): string {
+  return value.trim().replace(/[\s-]+/g, '_').toLowerCase();
+}
+
+function buildScrapeContext(body: ScrapeRequestBody): ScrapeContext {
+  const normalizedName = cleanOptionalString(body.normalized_name);
+
+  return {
+    list_item_id: cleanOptionalString(body.list_item_id),
+    supermarket_item_id: cleanOptionalString(body.supermarket_item_id),
+    normalized_name: normalizedName ? normaliseMetadataName(normalizedName) : undefined,
+  };
+}
+
+function buildQueries(body: ScrapeRequestBody): string[] {
+  const fromArray = Array.isArray(body.queries) ? body.queries : [];
+  const fromSingle = [body.query, body.item_name, body.normalized_name]
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+
+  return [...fromArray, ...fromSingle]
+    .map((query) => query.trim().replace(/_/g, ' '))
+    .filter(Boolean)
+    .filter((query, index, arr) => arr.findIndex((other) => other.toLowerCase() === query.toLowerCase()) === index);
+}
+
+function handleTescoScrape(req: any, res: any) {
   const body = req.body as ScrapeRequestBody;
-  const queries = body.queries ?? ['baked beans', 'whole milk', 'sourdough'];
+  const queries = buildQueries(body);
   const maxResultsPerQuery = body.maxResultsPerQuery ?? 200;
 
-  if (!Array.isArray(queries) || !queries.length || queries.some((query) => typeof query !== 'string' || !query.trim())) {
-    res.status(400).json({ success: false, error: 'queries must be a non-empty string array' });
+  if (!queries.length) {
+    res.status(400).json({
+      success: false,
+      error: 'Provide at least one query using queries[], query, item_name, or normalized_name',
+    });
     return;
   }
 
@@ -31,6 +71,7 @@ scrapeRouter.post('/scrape/tesco', requireApiKey, (req, res) => {
   const cleanQueries = queries.map((query) => query.trim()).filter(Boolean);
   const maxTescoQueries = getPositiveIntegerFromEnv('MAX_TESCO_QUERIES', 200);
   const limitedQueries = cleanQueries.slice(0, maxTescoQueries);
+  const scrapeContext = buildScrapeContext(body);
 
   console.log('[scrape/tesco] Prepared Tesco job', {
     originalQueryCount: cleanQueries.length,
@@ -38,12 +79,14 @@ scrapeRouter.post('/scrape/tesco', requireApiKey, (req, res) => {
     maxTescoQueries,
     maxResultsPerQuery,
     querySample: limitedQueries.slice(0, 5),
+    hasListItemContext: Boolean(scrapeContext.list_item_id),
+    hasSupermarketItemContext: Boolean(scrapeContext.supermarket_item_id),
   });
 
   const jobId = nanoid();
   const job = createJob(jobId, limitedQueries.length);
 
-  void runTescoJob(jobId, limitedQueries, maxResultsPerQuery);
+  void runTescoJob(jobId, limitedQueries, maxResultsPerQuery, scrapeContext);
 
   res.status(202).json({
     success: true,
@@ -54,9 +97,17 @@ scrapeRouter.post('/scrape/tesco', requireApiKey, (req, res) => {
     originalQueryCount: cleanQueries.length,
     maxTescoQueries,
   });
-});
+}
 
-async function runTescoJob(jobId: string, queries: string[], maxResultsPerQuery: number): Promise<void> {
+scrapeRouter.post('/scrape/tesco', requireApiKey, handleTescoScrape);
+scrapeRouter.post('/scrape', requireApiKey, handleTescoScrape);
+
+async function runTescoJob(
+  jobId: string,
+  queries: string[],
+  maxResultsPerQuery: number,
+  scrapeContext: ScrapeContext,
+): Promise<void> {
   try {
     const products = await scrapeTesco(queries, maxResultsPerQuery);
     const scrappeddate = new Date().toISOString();
@@ -65,6 +116,7 @@ async function runTescoJob(jobId: string, queries: string[], maxResultsPerQuery:
       ...product,
       scrappeddate,
       scraper_job_id: jobId,
+      ...scrapeContext,
     }));
 
     const insertedCount = await insertProductScrappedRows(rows);
