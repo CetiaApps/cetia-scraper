@@ -45,14 +45,15 @@ export async function scrapeTesco(
   maxResultsPerQuery: number,
 ): Promise<ScrapedProduct[]> {
   const results: ScrapedProduct[] = [];
+  const expandedQueries = expandQueries(queries);
 
   console.log('[tescoCrawler] Starting Bright Data Tesco scrape', {
-    queryCount: queries.length,
+    queryCount: expandedQueries.length,
     maxResultsPerQuery,
-    querySample: queries.slice(0, 3),
+    querySample: expandedQueries.slice(0, 8),
   });
 
-  for (const query of queries) {
+  for (const query of expandedQueries) {
     const html = await fetchTescoHtml(query);
     const products = extractTescoProductsFromHtml(html, query, maxResultsPerQuery);
 
@@ -65,7 +66,7 @@ export async function scrapeTesco(
   }
 
   console.log('[tescoCrawler] Tesco scrape finished', {
-    queryCount: queries.length,
+    queryCount: expandedQueries.length,
     resultCount: results.length,
   });
 
@@ -116,7 +117,8 @@ function extractTescoProductsFromHtml(
   query: string,
   maxResults: number,
 ): ScrapedProduct[] {
-  const productRecords = extractProductRecords(html);
+  const productRecords = extractProductRecords(html)
+    .filter((product) => isRelevantTescoProduct(product, query));
   const limit = Math.min(productRecords.length, getPositiveIntegerFromEnv('MAX_RESULTS_PER_QUERY', maxResults));
 
   return productRecords.slice(0, limit).map((product, index) => {
@@ -211,6 +213,134 @@ function extractProductRecords(html: string): TescoProductRecord[] {
   }
 
   return records;
+}
+
+function isRelevantTescoProduct(product: TescoProductRecord, query: string): boolean {
+  const queryNorm = normaliseText(query);
+  const text = normaliseText([
+    product.title,
+    product.shortDescription,
+    product.brandName,
+  ].filter(Boolean).join(' '));
+  const price = product.price?.actual;
+
+  if (!text || typeof price !== 'number' || price <= 0) return false;
+
+  const herb = herbTermForQuery(queryNorm);
+  if (herb) {
+    if (!containsTermVariant(text, herb)) return false;
+    if (price > 8) return false;
+    return !/\b(pesto|sauce|passata|soup|pizza|pasta|ready meal|meal kit|bourbon|whisky|whiskey|gin|vodka|rum|beer|wine|liqueur|dog|cat|pet|candle|soap|shampoo)\b/.test(text);
+  }
+
+  const plantMilk = plantMilkTermForQuery(queryNorm);
+  if (plantMilk) {
+    if (!containsTermVariant(text, plantMilk)) return false;
+    if (!/\b(milk|drink|beverage)\b/.test(text)) return false;
+    return !/\b(chocolate|praline|biscuit|cake|soap|shampoo|lotion|formula|baby)\b/.test(text);
+  }
+
+  if (isPlainMilkQuery(queryNorm)) {
+    if (!containsTermVariant(text, 'milk')) return false;
+    return !/\b(milk chocolate|chocolate|praline|biscuit|cake|soap|shampoo|lotion|formula|baby|condensed|evaporated|powdered)\b/.test(text);
+  }
+
+  return true;
+}
+
+function expandQueries(queries: string[]): string[] {
+  const out: string[] = [];
+
+  for (const query of queries.map((q) => q.trim()).filter(Boolean)) {
+    const norm = normaliseText(query);
+    const herb = herbTermForQuery(norm);
+    const plantMilk = plantMilkTermForQuery(norm);
+
+    if (herb) {
+      addQuery(out, herb);
+      addQuery(out, `fresh ${herb}`);
+      addQuery(out, `${herb} leaves`);
+      addQuery(out, `${herb} pot`);
+      addQuery(out, `dried ${herb}`);
+      if (norm !== `${herb}s`) addQuery(out, query);
+      continue;
+    }
+
+    if (plantMilk) {
+      addQuery(out, `${plantMilk} milk`);
+      addQuery(out, `${plantMilk} drink`);
+      addQuery(out, `${plantMilk} dairy free`);
+      if (norm !== `${plantMilk} milks`) addQuery(out, query);
+      continue;
+    }
+
+    addQuery(out, query);
+
+    if (isPlainMilkQuery(norm)) {
+      addQuery(out, 'milk');
+      addQuery(out, 'semi skimmed milk');
+      addQuery(out, 'whole milk');
+    }
+  }
+
+  return out.slice(0, getPositiveIntegerFromEnv('MAX_EXPANDED_QUERIES', 7));
+}
+
+function addQuery(out: string[], query: string): void {
+  const cleaned = query.trim().replace(/\s+/g, ' ');
+  if (!cleaned) return;
+  const key = normaliseText(cleaned);
+  if (!out.some((existing) => normaliseText(existing) === key)) out.push(cleaned);
+}
+
+function herbTermForQuery(queryNorm: string): string | null {
+  const herbs = ['basil', 'parsley', 'coriander', 'mint', 'thyme', 'rosemary', 'oregano', 'sage', 'dill', 'chives'];
+  return herbs.find((herb) => containsTermVariant(queryNorm, herb)) ?? null;
+}
+
+function plantMilkTermForQuery(queryNorm: string): string | null {
+  const terms = ['almond', 'oat', 'soya', 'soy', 'coconut', 'rice', 'cashew', 'hazelnut'];
+  if (!isMilkQuery(queryNorm)) return null;
+  return terms.find((term) => containsTermVariant(queryNorm, term)) ?? null;
+}
+
+function isMilkQuery(queryNorm: string): boolean {
+  return containsTermVariant(queryNorm, 'milk');
+}
+
+function isPlainMilkQuery(queryNorm: string): boolean {
+  return isMilkQuery(queryNorm) && !plantMilkTermForQuery(queryNorm) && !/\b(chocolate|strawberry|banana|flavoured|shake|milkshake)\b/.test(queryNorm);
+}
+
+function containsTermVariant(text: string, term: string): boolean {
+  return termVariants(term).some((variant) => new RegExp(`(^| )${escapeRegex(variant)}( |$)`).test(text));
+}
+
+function termVariants(term: string): string[] {
+  const variants = new Set<string>();
+  const cleaned = normaliseText(term);
+  if (!cleaned) return [];
+
+  variants.add(cleaned);
+  if (cleaned.endsWith('ies') && cleaned.length > 4) variants.add(`${cleaned.slice(0, -3)}y`);
+  if (cleaned.endsWith('es') && cleaned.length > 4) variants.add(cleaned.slice(0, -2));
+  if (cleaned.endsWith('s') && cleaned.length > 3) variants.add(cleaned.slice(0, -1));
+  if (!cleaned.endsWith('s') && cleaned.length > 2) variants.add(`${cleaned}s`);
+
+  return Array.from(variants);
+}
+
+function normaliseText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function extractBalancedJsonObject(text: string, startIndex: number): string | null {
