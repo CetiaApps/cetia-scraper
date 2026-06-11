@@ -99,8 +99,44 @@ function handleTescoScrape(req: any, res: any) {
   });
 }
 
+async function handleDebugScrape(req: any, res: any) {
+  try {
+    const body = req.body as ScrapeRequestBody;
+    const queries = buildQueries(body);
+    const maxResultsPerQuery = body.maxResultsPerQuery ?? 10;
+
+    if (!queries.length) {
+      res.status(400).json({
+        success: false,
+        error: 'Provide at least one query using queries[], query, item_name, or normalized_name',
+      });
+      return;
+    }
+
+    if (!Number.isFinite(maxResultsPerQuery) || maxResultsPerQuery < 1 || maxResultsPerQuery > 200) {
+      res.status(400).json({ success: false, error: 'maxResultsPerQuery must be between 1 and 200' });
+      return;
+    }
+
+    const products = await scrapeTesco(queries, maxResultsPerQuery);
+
+    res.json({
+      success: true,
+      queryCount: queries.length,
+      resultCount: products.length,
+      products: products.slice(0, maxResultsPerQuery),
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 scrapeRouter.post('/scrape/tesco', requireApiKey, handleTescoScrape);
 scrapeRouter.post('/scrape', requireApiKey, handleTescoScrape);
+scrapeRouter.post('/debug-scrape', requireApiKey, handleDebugScrape);
 
 async function runTescoJob(
   jobId: string,
