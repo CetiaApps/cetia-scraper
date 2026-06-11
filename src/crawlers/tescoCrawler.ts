@@ -224,7 +224,7 @@ function isRelevantTescoProduct(product: TescoProductRecord, query: string): boo
   ].filter(Boolean).join(' '));
   const price = product.price?.actual;
 
-  if (!text || typeof price !== 'number' || price <= 0) return false;
+  if (!text || typeof price !== 'number' || price <= 0 || price >= 50) return false;
 
   const herb = herbTermForQuery(queryNorm);
   if (herb) {
@@ -243,6 +243,16 @@ function isRelevantTescoProduct(product: TescoProductRecord, query: string): boo
   if (isPlainMilkQuery(queryNorm)) {
     if (!containsTermVariant(text, 'milk')) return false;
     return !/\b(milk chocolate|chocolate|praline|biscuit|cake|soap|shampoo|lotion|formula|baby|condensed|evaporated|powdered)\b/.test(text);
+  }
+
+  if (isPaperTowelQuery(queryNorm)) {
+    if (/\b(sanitary|period|pads?|tampons?|liners?|baking|parchment|greaseproof|toilet|bathroom)\b/.test(text)) return false;
+    return /\b(?:paper|kitchen|household)\s+towels?\b|\btowels?\b|\bkitchen\s+roll\b/.test(text);
+  }
+
+  if (queryNorm.includes('carrot')) {
+    if (!containsTermVariant(text, 'carrot')) return false;
+    return !/\b(carrot\s?cake|carrot\s?soup|soup|carrot\s?sticks|ready meal|baby food|mash|swede|parsnip|peas?|broccoli|courgette|beans?|pet|dog|rabbit|guinea|hamster)\b/.test(text);
   }
 
   return true;
@@ -281,6 +291,13 @@ function expandQueries(queries: string[]): string[] {
       addQuery(out, 'semi skimmed milk');
       addQuery(out, 'whole milk');
     }
+
+    if (isPaperTowelQuery(norm)) {
+      addQuery(out, 'paper towel');
+      addQuery(out, 'kitchen roll');
+      addQuery(out, 'kitchen towels');
+      addQuery(out, 'household towels');
+    }
   }
 
   return out.slice(0, getPositiveIntegerFromEnv('MAX_EXPANDED_QUERIES', 7));
@@ -310,6 +327,10 @@ function isMilkQuery(queryNorm: string): boolean {
 
 function isPlainMilkQuery(queryNorm: string): boolean {
   return isMilkQuery(queryNorm) && !plantMilkTermForQuery(queryNorm) && !/\b(chocolate|strawberry|banana|flavoured|shake|milkshake)\b/.test(queryNorm);
+}
+
+function isPaperTowelQuery(queryNorm: string): boolean {
+  return (queryNorm.includes('paper') && queryNorm.includes('towel')) || queryNorm.includes('kitchen roll');
 }
 
 function containsTermVariant(text: string, term: string): boolean {
