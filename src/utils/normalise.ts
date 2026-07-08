@@ -10,13 +10,13 @@ export function toNumber(value: unknown): number | null {
 }
 
 export function normaliseWhitespace(value: string | null | undefined): string | null {
-  if (!value) return null;
+  if (typeof value !== 'string') return null;
   const cleaned = value.replace(/\s+/g, ' ').trim();
   return cleaned.length ? cleaned : null;
 }
 
-export function absoluteTescoUrl(value: string | null): string | null {
-  if (!value) return null;
+export function absoluteTescoUrl(value: string | null | undefined): string | null {
+  if (typeof value !== 'string' || !value) return null;
   if (value.startsWith('http')) return value;
   if (value.startsWith('/')) return `https://www.tesco.com${value}`;
   return value;
