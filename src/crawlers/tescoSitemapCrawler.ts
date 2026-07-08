@@ -19,6 +19,7 @@ export interface TescoSitemapIndexResult {
   errors: TescoSitemapError[];
   sitemap_urls_processed: number;
   pages_found: number;
+  pages_skipped: number;
 }
 
 const DEFAULT_SITEMAPS = [
@@ -65,9 +66,11 @@ export async function indexTescoSitemap(input: {
   sitemap_urls?: unknown;
   max_pages?: unknown;
   max_depth?: unknown;
+  offset?: unknown;
 }): Promise<TescoSitemapIndexResult> {
   const maxPages = Math.min(Math.max(Number(input.max_pages) || 100, 1), 40000);
   const maxDepth = Math.min(Math.max(Number(input.max_depth) || 2, 0), 5);
+  const offset = Math.min(Math.max(Number(input.offset) || 0, 0), 100000);
   const queue = cleanSitemaps(input.sitemap_urls).map((url) => ({
     url,
     depth: 0,
@@ -77,6 +80,7 @@ export async function indexTescoSitemap(input: {
   const pages = new Map<string, TescoIndexedPage>();
   const errors: TescoSitemapError[] = [];
   let processed = 0;
+  let productUrlsSeen = 0;
 
   while (queue.length > 0 && pages.size < maxPages && visited.size < 500) {
     const current = queue.shift()!;
@@ -104,6 +108,8 @@ export async function indexTescoSitemap(input: {
         if (!absoluteUrl) continue;
 
         if (isTescoProductUrl(absoluteUrl)) {
+          productUrlsSeen += 1;
+          if (productUrlsSeen <= offset) continue;
           pages.set(absoluteUrl, {
             page_url: absoluteUrl,
             product_id: productIdFromTescoUrl(absoluteUrl),
@@ -139,5 +145,6 @@ export async function indexTescoSitemap(input: {
     errors,
     sitemap_urls_processed: processed,
     pages_found: pages.size,
+    pages_skipped: Math.min(productUrlsSeen, offset),
   };
 }

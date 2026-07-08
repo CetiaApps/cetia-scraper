@@ -23,6 +23,7 @@ tescoSitemapRouter.post(
         errors: result.errors,
         sitemap_urls_processed: result.sitemap_urls_processed,
         pages_found: result.pages_found,
+        pages_skipped: result.pages_skipped,
       });
     } catch (error) {
       res.status(500).json({
