@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { fetchViaBrightData } from "../services/brightdata.js";
 import {
   absoluteTescoUrl,
@@ -48,6 +49,7 @@ export interface TescoProductPageError {
   http_status: number | null;
   error_code: string;
   error_message: string;
+  metadata?: Record<string, unknown>;
 }
 
 interface TescoEmbeddedProduct {
@@ -127,13 +129,20 @@ export async function scrapeTescoProductPages(
         if (item) {
           items.push(item);
         } else {
+          const productId = page.product_id ?? productIdFromTescoUrl(page.page_url);
           errors.push({
             product_url: page.page_url,
-            product_id: page.product_id ?? productIdFromTescoUrl(page.page_url),
+            product_id: productId,
             http_status: response.status,
             error_code: "TESCO_PRODUCT_PAGE_PARSE_ERROR",
             error_message:
               "Tesco product page was fetched but no product/price data could be extracted.",
+            metadata: buildParseDebugMetadata({
+              html: response.body,
+              productId,
+              contentType: response.contentType,
+              httpStatus: response.status,
+            }),
           });
         }
       } catch (error) {
@@ -178,6 +187,60 @@ function extractTescoProductPage(
     );
 
   return buildFromMetaFallback(html, page);
+}
+
+function buildParseDebugMetadata(input: {
+  html: string;
+  productId: string | null;
+  contentType: string | null;
+  httpStatus: number;
+}): Record<string, unknown> {
+  const { html, productId } = input;
+  const productIdPattern = productId
+    ? new RegExp(productId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    : null;
+
+  return {
+    html_length: html.length,
+    html_sha256: createHash("sha256").update(html).digest("hex"),
+    html_preview: sanitisedHtmlPreview(html),
+    content_type: input.contentType,
+    response_status: input.httpStatus,
+    title_tag: titleTag(html),
+    has_price_symbol: /£|&pound;|\bpound\b|\bprice\b/i.test(html),
+    has_product_id: productIdPattern ? productIdPattern.test(html) : false,
+    has_application_ld_json: /application\/ld\+json/i.test(html),
+    has_producttype_json: /"ProductType:\d+"/i.test(html),
+    has_next_data: /id=["']__NEXT_DATA__["']/i.test(html),
+    has_redux_state:
+      /__PRELOADED_STATE__|__REDUX_STATE__|redux|window\.__INITIAL_STATE__/i.test(html),
+    has_consent_text:
+      /cookie|consent|privacy preferences|onetrust|trustarc|accept all/i.test(html),
+    has_block_text:
+      /access denied|request blocked|forbidden|captcha|unusual traffic|temporarily unavailable/i.test(
+        html,
+      ),
+    has_bot_text:
+      /bot|robot|automated|verify you are human|security check|are you a human/i.test(html),
+    script_count: (html.match(/<script\b/gi) ?? []).length,
+    json_ld_count: (html.match(/application\/ld\+json/gi) ?? []).length,
+    parser_attempts: [
+      "ProductType embedded JSON",
+      "JSON-LD Product schema",
+      "__NEXT_DATA__ product object",
+      "meta/title/price fallback",
+    ],
+  };
+}
+
+function sanitisedHtmlPreview(html: string): string {
+  return html
+    .replace(/<script\b[\s\S]*?<\/script>/gi, " [script removed] ")
+    .replace(/<style\b[\s\S]*?<\/style>/gi, " [style removed] ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 800);
 }
 
 function buildFromProductType(

@@ -12,6 +12,7 @@ export interface BrightDataFetchResult {
   url: string;
   status: number;
   ok: boolean;
+  contentType: string | null;
   body: string;
 }
 
@@ -49,6 +50,7 @@ export async function fetchViaBrightData(
     url,
     status: response.status,
     ok: response.ok,
+    contentType: response.headers.get("content-type"),
     body,
   };
 }
