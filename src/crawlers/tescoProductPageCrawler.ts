@@ -1,0 +1,605 @@
+import { fetchViaBrightData } from "../services/brightdata.js";
+import {
+  absoluteTescoUrl,
+  normaliseWhitespace,
+  toNumber,
+} from "../utils/normalise.js";
+import { removeImageFields } from "../utils/removeImages.js";
+import { productIdFromTescoUrl } from "./tescoSitemapCrawler.js";
+
+export interface TescoProductPageInput {
+  page_url: string;
+  product_id?: string | null;
+}
+
+export interface TescoProductPageItem {
+  supermarket_name: "Tesco";
+  supermarket_code: "tesco";
+  product_url: string;
+  product_id: string | null;
+  product_name: string | null;
+  product_title: string | null;
+  brand: string | null;
+  description: string | null;
+  price: number | null;
+  price_text: string | null;
+  currency: string;
+  unit_price: string | null;
+  unit_price_value: number | null;
+  unit_price_unit: string | null;
+  offer_text: string | null;
+  promotion_text: string | null;
+  availability: string | null;
+  in_stock: boolean | null;
+  image_url: string | null;
+  category: string | null;
+  category_path: string | null;
+  sku: string | null;
+  gtin: string | null;
+  barcode: string | null;
+  raw_data: Record<string, unknown>;
+  extraction_method: string;
+  extraction_confidence: number;
+}
+
+export interface TescoProductPageError {
+  product_url: string;
+  product_id: string | null;
+  http_status: number | null;
+  error_code: string;
+  error_message: string;
+}
+
+interface TescoEmbeddedProduct {
+  id?: string;
+  tpnb?: string;
+  tpnc?: string;
+  gtin?: string;
+  title?: string;
+  name?: string;
+  brandName?: string;
+  defaultImageUrl?: string;
+  shortDescription?: string | null;
+  description?: string | null;
+  status?: string;
+  isForSale?: boolean;
+  price?: {
+    actual?: number | string;
+    unitPrice?: number | string;
+    unitOfMeasure?: string;
+  };
+  promotions?: Array<{
+    promotionText?: string;
+    offerText?: string;
+    description?: string;
+  }>;
+}
+
+interface JsonLdProduct {
+  "@type"?: string | string[];
+  name?: string;
+  brand?: string | { name?: string };
+  description?: string;
+  image?: string | string[];
+  sku?: string;
+  gtin?: string;
+  gtin13?: string;
+  offers?:
+    | {
+        price?: number | string;
+        priceCurrency?: string;
+        availability?: string;
+      }
+    | Array<{
+        price?: number | string;
+        priceCurrency?: string;
+        availability?: string;
+      }>;
+}
+
+export async function scrapeTescoProductPages(
+  pages: TescoProductPageInput[],
+  maxConcurrency: number,
+): Promise<{ items: TescoProductPageItem[]; errors: TescoProductPageError[] }> {
+  const concurrency = Math.min(Math.max(Math.floor(maxConcurrency) || 2, 1), 5);
+  const items: TescoProductPageItem[] = [];
+  const errors: TescoProductPageError[] = [];
+  let cursor = 0;
+
+  async function worker(): Promise<void> {
+    while (cursor < pages.length) {
+      const page = pages[cursor++];
+      try {
+        const response = await fetchViaBrightData(page.page_url);
+
+        if (!response.ok) {
+          errors.push({
+            product_url: page.page_url,
+            product_id: page.product_id ?? productIdFromTescoUrl(page.page_url),
+            http_status: response.status,
+            error_code: "BRIGHTDATA_PRODUCT_PAGE_FETCH_ERROR",
+            error_message: `Bright Data product page fetch failed with HTTP ${response.status}: ${response.body.slice(0, 500)}`,
+          });
+          continue;
+        }
+
+        const item = extractTescoProductPage(response.body, page);
+        if (item) {
+          items.push(item);
+        } else {
+          errors.push({
+            product_url: page.page_url,
+            product_id: page.product_id ?? productIdFromTescoUrl(page.page_url),
+            http_status: response.status,
+            error_code: "TESCO_PRODUCT_PAGE_PARSE_ERROR",
+            error_message:
+              "Tesco product page was fetched but no product/price data could be extracted.",
+          });
+        }
+      } catch (error) {
+        errors.push({
+          product_url: page.page_url,
+          product_id: page.product_id ?? productIdFromTescoUrl(page.page_url),
+          http_status: null,
+          error_code: "BRIGHTDATA_PRODUCT_PAGE_FETCH_EXCEPTION",
+          error_message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, pages.length) }, () => worker()),
+  );
+
+  return { items, errors };
+}
+
+function extractTescoProductPage(
+  html: string,
+  page: TescoProductPageInput,
+): TescoProductPageItem | null {
+  const productType = extractProductTypeRecord(
+    html,
+    page.product_id ?? productIdFromTescoUrl(page.page_url),
+  );
+  if (productType) return buildFromProductType(productType, page);
+
+  const jsonLd = extractJsonLdProduct(html);
+  if (jsonLd) return buildFromJsonLd(jsonLd, page);
+
+  const nextProduct = extractFromNextData(html);
+  if (nextProduct)
+    return buildFromPlainObject(
+      nextProduct,
+      page,
+      "brightdata-tesco-next-data",
+      0.7,
+    );
+
+  return buildFromMetaFallback(html, page);
+}
+
+function buildFromProductType(
+  product: TescoEmbeddedProduct,
+  page: TescoProductPageInput,
+): TescoProductPageItem {
+  const actualPrice = toNumber(product.price?.actual);
+  const priceText = actualPrice !== null ? `£${actualPrice.toFixed(2)}` : null;
+  const unitPriceValue = toNumber(product.price?.unitPrice);
+  const unitPrice =
+    unitPriceValue !== null
+      ? `£${unitPriceValue.toFixed(2)}/${product.price?.unitOfMeasure || ""}`.replace(
+          /\/$/,
+          "",
+        )
+      : null;
+  const promotionText =
+    product.promotions?.[0]?.promotionText ||
+    product.promotions?.[0]?.offerText ||
+    product.promotions?.[0]?.description ||
+    null;
+  const title = normaliseWhitespace(product.title ?? product.name ?? null);
+
+  return {
+    supermarket_name: "Tesco",
+    supermarket_code: "tesco",
+    product_url: page.page_url,
+    product_id:
+      product.tpnc ??
+      product.id ??
+      page.product_id ??
+      productIdFromTescoUrl(page.page_url),
+    product_name: title,
+    product_title: title,
+    brand: normaliseWhitespace(product.brandName ?? null),
+    description: normaliseWhitespace(
+      product.shortDescription ?? product.description ?? null,
+    ),
+    price: actualPrice,
+    price_text: priceText,
+    currency: "GBP",
+    unit_price: unitPrice,
+    unit_price_value: unitPriceValue,
+    unit_price_unit: normaliseWhitespace(product.price?.unitOfMeasure ?? null),
+    offer_text: promotionText,
+    promotion_text: promotionText,
+    availability: normaliseWhitespace(product.status ?? null),
+    in_stock:
+      typeof product.isForSale === "boolean"
+        ? product.isForSale
+        : product.status
+          ? /available|in stock|for sale/i.test(product.status)
+          : null,
+    image_url: absoluteTescoUrl(product.defaultImageUrl ?? null),
+    category: null,
+    category_path: null,
+    sku: product.tpnb ?? null,
+    gtin: product.gtin ?? null,
+    barcode: product.gtin ?? null,
+    raw_data: removeImageFields({ product }) as Record<string, unknown>,
+    extraction_method: "brightdata-tesco-producttype-json",
+    extraction_confidence: actualPrice !== null && title ? 0.95 : 0.75,
+  };
+}
+
+function buildFromJsonLd(
+  product: JsonLdProduct,
+  page: TescoProductPageInput,
+): TescoProductPageItem {
+  const offer = Array.isArray(product.offers)
+    ? product.offers[0]
+    : product.offers;
+  const price = toNumber(offer?.price);
+  const brand =
+    typeof product.brand === "string" ? product.brand : product.brand?.name;
+  const title = normaliseWhitespace(product.name ?? null);
+  const image = Array.isArray(product.image) ? product.image[0] : product.image;
+
+  return {
+    supermarket_name: "Tesco",
+    supermarket_code: "tesco",
+    product_url: page.page_url,
+    product_id: page.product_id ?? productIdFromTescoUrl(page.page_url),
+    product_name: title,
+    product_title: title,
+    brand: normaliseWhitespace(brand ?? null),
+    description: normaliseWhitespace(product.description ?? null),
+    price,
+    price_text: price !== null ? `£${price.toFixed(2)}` : null,
+    currency: offer?.priceCurrency || "GBP",
+    unit_price: null,
+    unit_price_value: null,
+    unit_price_unit: null,
+    offer_text: null,
+    promotion_text: null,
+    availability: normaliseWhitespace(offer?.availability ?? null),
+    in_stock: offer?.availability
+      ? /in stock|instock/i.test(offer.availability)
+      : null,
+    image_url: absoluteTescoUrl(image ?? null),
+    category: null,
+    category_path: null,
+    sku: product.sku ?? null,
+    gtin: product.gtin13 ?? product.gtin ?? null,
+    barcode: product.gtin13 ?? product.gtin ?? null,
+    raw_data: removeImageFields({ product }) as Record<string, unknown>,
+    extraction_method: "brightdata-tesco-json-ld",
+    extraction_confidence: price !== null && title ? 0.85 : 0.65,
+  };
+}
+
+function buildFromPlainObject(
+  product: Record<string, unknown>,
+  page: TescoProductPageInput,
+  method: string,
+  confidence: number,
+): TescoProductPageItem {
+  const title =
+    stringFrom(product.title) ??
+    stringFrom(product.name) ??
+    stringFrom(product.productName);
+  const brand = stringFrom(product.brandName) ?? stringFrom(product.brand);
+  const price =
+    toNumber(getPath(product, ["price", "actual"])) ??
+    toNumber(getPath(product, ["price", "value"])) ??
+    toNumber(product.price) ??
+    toNumber(product.priceText);
+  const priceText =
+    stringFrom(product.priceText) ??
+    (price !== null ? `£${price.toFixed(2)}` : null);
+  const productId =
+    stringFrom(product.tpnc) ??
+    stringFrom(product.id) ??
+    stringFrom(product.productId) ??
+    page.product_id ??
+    productIdFromTescoUrl(page.page_url);
+
+  return {
+    supermarket_name: "Tesco",
+    supermarket_code: "tesco",
+    product_url: page.page_url,
+    product_id: productId,
+    product_name: normaliseWhitespace(title),
+    product_title: normaliseWhitespace(title),
+    brand: normaliseWhitespace(brand),
+    description: normaliseWhitespace(
+      stringFrom(product.shortDescription) ?? stringFrom(product.description),
+    ),
+    price,
+    price_text: priceText,
+    currency: stringFrom(product.currency) ?? "GBP",
+    unit_price: stringFrom(product.unitPrice) ?? null,
+    unit_price_value: toNumber(product.unitPriceValue),
+    unit_price_unit: stringFrom(product.unitPriceUnit),
+    offer_text: stringFrom(product.offerText),
+    promotion_text: stringFrom(product.promotionText),
+    availability:
+      stringFrom(product.status) ?? stringFrom(product.availability),
+    in_stock: booleanFrom(product.isForSale) ?? booleanFrom(product.inStock),
+    image_url: absoluteTescoUrl(
+      stringFrom(product.defaultImageUrl) ?? stringFrom(product.imageUrl),
+    ),
+    category: stringFrom(product.category),
+    category_path: stringFrom(product.categoryPath),
+    sku: stringFrom(product.tpnb) ?? stringFrom(product.sku),
+    gtin: stringFrom(product.gtin),
+    barcode: stringFrom(product.gtin) ?? stringFrom(product.barcode),
+    raw_data: removeImageFields({ product }) as Record<string, unknown>,
+    extraction_method: method,
+    extraction_confidence: confidence,
+  };
+}
+
+function buildFromMetaFallback(
+  html: string,
+  page: TescoProductPageInput,
+): TescoProductPageItem | null {
+  const title = metaContent(html, "og:title") ?? titleTag(html);
+  const priceText =
+    metaContent(html, "product:price:amount") ??
+    firstMatch(html, /(?:£|&pound;)\s*([0-9]+(?:\.[0-9]{1,2})?)/i);
+  const price = toNumber(priceText);
+
+  if (!title && price === null) return null;
+
+  return {
+    supermarket_name: "Tesco",
+    supermarket_code: "tesco",
+    product_url: page.page_url,
+    product_id: page.product_id ?? productIdFromTescoUrl(page.page_url),
+    product_name: normaliseWhitespace(title),
+    product_title: normaliseWhitespace(title),
+    brand: null,
+    description: normaliseWhitespace(
+      metaContent(html, "description") ?? metaContent(html, "og:description"),
+    ),
+    price,
+    price_text: price !== null ? `£${price.toFixed(2)}` : null,
+    currency: "GBP",
+    unit_price: null,
+    unit_price_value: null,
+    unit_price_unit: null,
+    offer_text: null,
+    promotion_text: null,
+    availability: null,
+    in_stock: null,
+    image_url: absoluteTescoUrl(metaContent(html, "og:image")),
+    category: null,
+    category_path: null,
+    sku: null,
+    gtin: null,
+    barcode: null,
+    raw_data: { title, priceText },
+    extraction_method: "brightdata-tesco-html-meta",
+    extraction_confidence: price !== null && title ? 0.45 : 0.25,
+  };
+}
+
+function extractProductTypeRecord(
+  html: string,
+  requestedProductId: string | null,
+): TescoEmbeddedProduct | null {
+  const records: TescoEmbeddedProduct[] = [];
+  const regex =
+    /"ProductType:(\d+)":\s*(\{[\s\S]*?)(?=,"[A-Za-z]+Type:|\}\}\}|\}\]\}|<\/script>)/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(html)) !== null) {
+    const productId = match[1];
+    const objectStart = match.index + `"ProductType:${productId}":`.length;
+    const objectText = extractBalancedJsonObject(html, objectStart);
+    if (!objectText) continue;
+
+    try {
+      const product = JSON.parse(objectText) as TescoEmbeddedProduct;
+      records.push({ ...product, id: product.id ?? productId });
+    } catch {
+      // Ignore malformed embedded product objects.
+    }
+  }
+
+  if (!records.length) return null;
+  return (
+    records.find(
+      (record) =>
+        record.tpnc === requestedProductId || record.id === requestedProductId,
+    ) ?? records[0]
+  );
+}
+
+function extractJsonLdProduct(html: string): JsonLdProduct | null {
+  const regex =
+    /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(html)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1].trim()) as unknown;
+      const candidates = Array.isArray(parsed) ? parsed : [parsed];
+      for (const candidate of candidates) {
+        const product = findJsonLdProduct(candidate);
+        if (product) return product;
+      }
+    } catch {
+      // Ignore malformed JSON-LD blocks.
+    }
+  }
+
+  return null;
+}
+
+function findJsonLdProduct(value: unknown): JsonLdProduct | null {
+  if (!value || typeof value !== "object") return null;
+  const obj = value as Record<string, unknown>;
+  const type = obj["@type"];
+  const types = Array.isArray(type) ? type : [type];
+  if (types.some((entry) => String(entry).toLowerCase() === "product"))
+    return obj as JsonLdProduct;
+
+  for (const nested of Object.values(obj)) {
+    if (Array.isArray(nested)) {
+      for (const item of nested) {
+        const found = findJsonLdProduct(item);
+        if (found) return found;
+      }
+    } else if (nested && typeof nested === "object") {
+      const found = findJsonLdProduct(nested);
+      if (found) return found;
+    }
+  }
+
+  return null;
+}
+
+function extractFromNextData(html: string): Record<string, unknown> | null {
+  const match = html.match(
+    /<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i,
+  );
+  if (!match) return null;
+
+  try {
+    const parsed = JSON.parse(match[1]) as unknown;
+    return findProductLikeObject(parsed);
+  } catch {
+    return null;
+  }
+}
+
+function findProductLikeObject(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findProductLikeObject(item);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  const obj = value as Record<string, unknown>;
+  const hasName =
+    typeof obj.title === "string" ||
+    typeof obj.name === "string" ||
+    typeof obj.productName === "string";
+  const hasPrice =
+    obj.price !== undefined ||
+    obj.priceText !== undefined ||
+    getPath(obj, ["price", "actual"]) !== undefined ||
+    getPath(obj, ["price", "value"]) !== undefined;
+  if (hasName && hasPrice) return obj;
+
+  for (const nested of Object.values(obj)) {
+    const found = findProductLikeObject(nested);
+    if (found) return found;
+  }
+
+  return null;
+}
+
+function extractBalancedJsonObject(
+  text: string,
+  startIndex: number,
+): string | null {
+  const firstBrace = text.indexOf("{", startIndex);
+  if (firstBrace < 0) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = firstBrace; index < text.length; index += 1) {
+    const char = text[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return text.slice(firstBrace, index + 1);
+    }
+  }
+
+  return null;
+}
+
+function getPath(value: Record<string, unknown>, path: string[]): unknown {
+  let current: unknown = value;
+  for (const part of path) {
+    if (!current || typeof current !== "object") return undefined;
+    current = (current as Record<string, unknown>)[part];
+  }
+  return current;
+}
+
+function stringFrom(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : null;
+}
+
+function booleanFrom(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+function metaContent(html: string, name: string): string | null {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(
+    `<meta[^>]+(?:property|name)=["']${escaped}["'][^>]+content=["']([^"']+)["'][^>]*>`,
+    "i",
+  );
+  return decodeHtml(re.exec(html)?.[1] ?? null);
+}
+
+function titleTag(html: string): string | null {
+  return decodeHtml(
+    html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? null,
+  );
+}
+
+function firstMatch(html: string, re: RegExp): string | null {
+  const match = re.exec(html);
+  if (!match) return null;
+  return match[0].replace(/&pound;/gi, "£");
+}
+
+function decodeHtml(value: string | null): string | null {
+  if (!value) return null;
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&pound;/g, "£")
+    .replace(/\s+/g, " ")
+    .trim();
+}
