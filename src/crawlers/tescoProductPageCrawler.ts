@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import {
-  fetchViaBrightData,
+  fetchTescoHtmlViaBrightData,
+  getTescoProductFetchMode,
+  type BrightDataFetchMode,
   type BrightDataFetchResult,
 } from "../services/brightdata.js";
 import {
@@ -57,7 +59,36 @@ export interface TescoProductPageError {
 
 export interface TescoProductPageScrapeOptions {
   allowRenderFallback?: boolean;
+  allow_render_fallback?: boolean;
   requestTimeoutMs?: number;
+  fetchMode?: BrightDataFetchMode;
+  fetch_mode?: BrightDataFetchMode;
+  debug?: boolean;
+}
+
+export interface TescoProductPageScrapeRequest extends TescoProductPageScrapeOptions {
+  pages: TescoProductPageInput[];
+  max_concurrency?: number;
+}
+
+export interface TescoProductPageScrapeStats {
+  raw_fetch_success: number;
+  render_fetch_success: number;
+  producttype_success: number;
+  jsonld_success: number;
+  nextdata_success: number;
+  meta_fallback_success: number;
+  parse_failed: number;
+  empty_html: number;
+  brightdata_retryable_errors: number;
+}
+
+export interface TescoProductPageScrapeResult {
+  items: TescoProductPageItem[];
+  errors: TescoProductPageError[];
+  scraped: number;
+  failed: number;
+  stats: TescoProductPageScrapeStats;
 }
 
 interface TescoEmbeddedProduct {
@@ -108,20 +139,46 @@ interface JsonLdProduct {
 }
 
 export async function scrapeTescoProductPages(
-  pages: TescoProductPageInput[],
-  maxConcurrency: number,
+  requestOrPages: TescoProductPageScrapeRequest | TescoProductPageInput[],
+  maxConcurrency?: number,
   options: TescoProductPageScrapeOptions = {},
-): Promise<{ items: TescoProductPageItem[]; errors: TescoProductPageError[] }> {
-  const concurrency = Math.min(Math.max(Math.floor(maxConcurrency) || 2, 1), 5);
+): Promise<TescoProductPageScrapeResult> {
+  const request = Array.isArray(requestOrPages)
+    ? { pages: requestOrPages, max_concurrency: maxConcurrency, ...options }
+    : requestOrPages;
+  const pages = request.pages;
+  const concurrency = Math.min(Math.max(Math.floor(request.max_concurrency ?? 2) || 2, 1), 5);
+  const scrapeOptions: TescoProductPageScrapeOptions = {
+    allowRenderFallback: request.allowRenderFallback ?? request.allow_render_fallback ?? true,
+    requestTimeoutMs: request.requestTimeoutMs,
+    fetchMode: request.fetchMode ?? request.fetch_mode ?? getTescoProductFetchMode(),
+    debug: request.debug === true,
+  } as TescoProductPageScrapeOptions & { allow_render_fallback?: boolean };
   const items: TescoProductPageItem[] = [];
   const errors: TescoProductPageError[] = [];
+  const stats: TescoProductPageScrapeStats = {
+    raw_fetch_success: 0,
+    render_fetch_success: 0,
+    producttype_success: 0,
+    jsonld_success: 0,
+    nextdata_success: 0,
+    meta_fallback_success: 0,
+    parse_failed: 0,
+    empty_html: 0,
+    brightdata_retryable_errors: 0,
+  };
   let cursor = 0;
 
   async function worker(): Promise<void> {
     while (cursor < pages.length) {
       const page = pages[cursor++];
       try {
-        const response = await fetchTescoProductPage(page, options);
+        const response = await fetchTescoProductPage(page, scrapeOptions);
+        stats.brightdata_retryable_errors += Number(response.retryableErrors ?? 0);
+        if (response.ok) {
+          if (response.render) stats.render_fetch_success++;
+          else stats.raw_fetch_success++;
+        }
 
         if (!response.ok) {
           errors.push({
@@ -129,12 +186,26 @@ export async function scrapeTescoProductPages(
             product_id: page.product_id ?? productIdFromTescoUrl(page.page_url),
             http_status: response.status,
             error_code: "BRIGHTDATA_PRODUCT_PAGE_FETCH_ERROR",
-            error_message: `Bright Data product page fetch failed with HTTP ${response.status}: ${response.body.slice(0, 500)}`,
+            error_message: response.error
+              ? `Bright Data product page fetch failed: ${response.error}`
+              : `Bright Data product page fetch failed with HTTP ${response.status}`,
+            metadata: buildParseDebugMetadata({
+              html: response.html,
+              productId: page.product_id ?? productIdFromTescoUrl(page.page_url),
+              contentType: response.contentType ?? null,
+              httpStatus: response.status,
+              render: response.render,
+              fetchAttempts: [response.render ? "render" : "raw"],
+              fetchElapsedMs: response.elapsedMs,
+              brightdataStatus: response.status,
+              debug: scrapeOptions.debug === true,
+            }),
           });
           continue;
         }
 
-        if (isEmptyHtml(response.body)) {
+        if (isEmptyHtml(response.html)) {
+          stats.empty_html++;
           const productId =
             page.product_id ?? productIdFromTescoUrl(page.page_url);
           errors.push({
@@ -145,23 +216,26 @@ export async function scrapeTescoProductPages(
             error_message:
               "Bright Data returned HTTP 200 for the Tesco product page but the response body was empty after raw and rendered attempts.",
             metadata: buildParseDebugMetadata({
-              html: response.body,
+              html: response.html,
               productId,
-              contentType: response.contentType,
+              contentType: response.contentType ?? null,
               httpStatus: response.status,
               render: response.render,
-              fetchAttempts: response.render
-                ? ["raw", "rendered"]
-                : ["raw"],
+              fetchAttempts: [response.render ? "render" : "raw"],
+              fetchElapsedMs: response.elapsedMs,
+              brightdataStatus: response.status,
+              debug: scrapeOptions.debug === true,
             }),
           });
           continue;
         }
 
-        const item = extractTescoProductPage(response.body, page);
+        const item = extractTescoProductPage(response.html, page);
         if (item) {
+          incrementParserStats(stats, item.extraction_method);
           items.push(item);
         } else {
+          stats.parse_failed++;
           const productId = page.product_id ?? productIdFromTescoUrl(page.page_url);
           errors.push({
             product_url: page.page_url,
@@ -171,14 +245,15 @@ export async function scrapeTescoProductPages(
             error_message:
               "Tesco product page was fetched but no product/price data could be extracted.",
             metadata: buildParseDebugMetadata({
-              html: response.body,
+              html: response.html,
               productId,
-              contentType: response.contentType,
+              contentType: response.contentType ?? null,
               httpStatus: response.status,
               render: response.render,
-              fetchAttempts: response.render
-                ? ["raw", "rendered"]
-                : ["raw"],
+              fetchAttempts: [response.render ? "render" : "raw"],
+              fetchElapsedMs: response.elapsedMs,
+              brightdataStatus: response.status,
+              debug: scrapeOptions.debug === true,
             }),
           });
         }
@@ -198,37 +273,54 @@ export async function scrapeTescoProductPages(
     Array.from({ length: Math.min(concurrency, pages.length) }, () => worker()),
   );
 
-  return { items, errors };
+  return { items, errors, scraped: items.length, failed: errors.length, stats };
 }
 
 async function fetchTescoProductPage(
   page: TescoProductPageInput,
   options: TescoProductPageScrapeOptions,
 ): Promise<BrightDataFetchResult> {
-  const rawResponse = await fetchViaBrightData(page.page_url, {
+  const mode = options.fetchMode ?? options.fetch_mode ?? getTescoProductFetchMode();
+  const allowFallback = options.allowRenderFallback ?? options.allow_render_fallback ?? true;
+  const firstRender = mode === "render_first" || mode === "render_only";
+  const first = await fetchTescoHtmlViaBrightData(page.page_url, {
+    render: firstRender,
     timeoutMs: options.requestTimeoutMs,
   });
-  if (!options.allowRenderFallback || !shouldRetryWithRenderedFetch(rawResponse)) {
-    return rawResponse;
+
+  const fallbackRender =
+    mode === "raw_first" ? true : mode === "render_first" ? false : null;
+  if (
+    fallbackRender === null ||
+    !allowFallback ||
+    !shouldRetryWithFallbackFetch(first)
+  ) {
+    return first;
   }
 
-  console.warn("[tescoProductPageCrawler] Retrying product page with render", {
+  console.warn("[tescoProductPageCrawler] Retrying product page with fallback fetch", {
     url: page.page_url,
-    status: rawResponse.status,
-    bodyLength: rawResponse.body.length,
-    reason: isEmptyHtml(rawResponse.body) ? "empty_html" : "unusable_html",
+    status: first.status,
+    bodyLength: first.html.length,
+    first_render: first.render,
+    fallback_render: fallbackRender,
+    reason: isEmptyHtml(first.html) ? "empty_html" : "unusable_html",
   });
 
-  return fetchViaBrightData(page.page_url, {
-    render: true,
+  const second = await fetchTescoHtmlViaBrightData(page.page_url, {
+    render: fallbackRender,
     timeoutMs: options.requestTimeoutMs,
   });
+  second.retryableErrors =
+    Number(first.retryableErrors ?? 0) + Number(second.retryableErrors ?? 0);
+  second.elapsedMs += first.elapsedMs;
+  second.attempt += first.attempt;
+  return second;
 }
 
-function shouldRetryWithRenderedFetch(response: BrightDataFetchResult): boolean {
+function shouldRetryWithFallbackFetch(response: BrightDataFetchResult): boolean {
   if (!response.ok) return false;
-  if (response.render) return false;
-  return isEmptyHtml(response.body) || isUnusableProductPageHtml(response.body);
+  return isEmptyHtml(response.html) || isUnusableProductPageHtml(response.html);
 }
 
 function isEmptyHtml(html: string): boolean {
@@ -279,24 +371,29 @@ function buildParseDebugMetadata(input: {
   httpStatus: number;
   render?: boolean;
   fetchAttempts?: string[];
+  fetchElapsedMs?: number;
+  brightdataStatus?: number;
+  debug?: boolean;
 }): Record<string, unknown> {
   const { html, productId } = input;
   const productIdPattern = productId
     ? new RegExp(productId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
     : null;
-
-  return {
+  const hasJsonLd = /application\/ld\+json/i.test(html);
+  const metadata: Record<string, unknown> = {
     html_length: html.length,
     html_sha256: createHash("sha256").update(html).digest("hex"),
-    html_preview: sanitisedHtmlPreview(html),
     content_type: input.contentType,
     response_status: input.httpStatus,
     render: input.render ?? false,
     fetch_attempts: input.fetchAttempts ?? ["raw"],
+    fetch_elapsed_ms: input.fetchElapsedMs ?? null,
+    brightdata_status: input.brightdataStatus ?? input.httpStatus,
     title_tag: titleTag(html),
-    has_price_symbol: /£|&pound;|\bpound\b|\bprice\b/i.test(html),
+    has_price_symbol: /\u00a3|&pound;|\bpound\b|\bprice\b/i.test(html),
     has_product_id: productIdPattern ? productIdPattern.test(html) : false,
-    has_application_ld_json: /application\/ld\+json/i.test(html),
+    has_json_ld: hasJsonLd,
+    has_application_ld_json: hasJsonLd,
     has_producttype_json: /"ProductType:\d+"/i.test(html),
     has_next_data: /id=["']__NEXT_DATA__["']/i.test(html),
     has_redux_state:
@@ -318,8 +415,23 @@ function buildParseDebugMetadata(input: {
       "meta/title/price fallback",
     ],
   };
+
+  if (input.debug === true || process.env.TESCO_DEBUG_HTML_PREVIEW === "true") {
+    metadata.html_preview = sanitisedHtmlPreview(html);
+  }
+
+  return metadata;
 }
 
+function incrementParserStats(
+  stats: TescoProductPageScrapeStats,
+  extractionMethod: string,
+) {
+  if (/producttype/i.test(extractionMethod)) stats.producttype_success++;
+  else if (/json-ld/i.test(extractionMethod)) stats.jsonld_success++;
+  else if (/next-data/i.test(extractionMethod)) stats.nextdata_success++;
+  else if (/html-meta/i.test(extractionMethod)) stats.meta_fallback_success++;
+}
 function sanitisedHtmlPreview(html: string): string {
   return html
     .replace(/<script\b[\s\S]*?<\/script>/gi, " [script removed] ")
@@ -327,7 +439,7 @@ function sanitisedHtmlPreview(html: string): string {
     .replace(/<!--[\s\S]*?-->/g, " ")
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, 800);
+    .slice(0, 500);
 }
 
 function buildFromProductType(
@@ -335,11 +447,11 @@ function buildFromProductType(
   page: TescoProductPageInput,
 ): TescoProductPageItem {
   const actualPrice = toNumber(product.price?.actual);
-  const priceText = actualPrice !== null ? `£${actualPrice.toFixed(2)}` : null;
+  const priceText = actualPrice !== null ? `Â£${actualPrice.toFixed(2)}` : null;
   const unitPriceValue = toNumber(product.price?.unitPrice);
   const unitPrice =
     unitPriceValue !== null
-      ? `£${unitPriceValue.toFixed(2)}/${product.price?.unitOfMeasure || ""}`.replace(
+      ? `Â£${unitPriceValue.toFixed(2)}/${product.price?.unitOfMeasure || ""}`.replace(
           /\/$/,
           "",
         )
@@ -416,7 +528,7 @@ function buildFromJsonLd(
     brand: normaliseWhitespace(brand ?? null),
     description: normaliseWhitespace(product.description ?? null),
     price,
-    price_text: price !== null ? `£${price.toFixed(2)}` : null,
+    price_text: price !== null ? `Â£${price.toFixed(2)}` : null,
     currency: offer?.priceCurrency || "GBP",
     unit_price: null,
     unit_price_value: null,
@@ -457,7 +569,7 @@ function buildFromPlainObject(
     toNumber(product.priceText);
   const priceText =
     stringFrom(product.priceText) ??
-    (price !== null ? `£${price.toFixed(2)}` : null);
+    (price !== null ? `Â£${price.toFixed(2)}` : null);
   const productId =
     stringFrom(product.tpnc) ??
     stringFrom(product.id) ??
@@ -508,7 +620,7 @@ function buildFromMetaFallback(
   const title = metaContent(html, "og:title") ?? titleTag(html);
   const priceText =
     metaContent(html, "product:price:amount") ??
-    firstMatch(html, /(?:£|&pound;)\s*([0-9]+(?:\.[0-9]{1,2})?)/i);
+    firstMatch(html, /(?:Â£|&pound;)\s*([0-9]+(?:\.[0-9]{1,2})?)/i);
   const price = toNumber(priceText);
 
   if (!title && price === null) return null;
@@ -525,7 +637,7 @@ function buildFromMetaFallback(
       metaContent(html, "description") ?? metaContent(html, "og:description"),
     ),
     price,
-    price_text: price !== null ? `£${price.toFixed(2)}` : null,
+    price_text: price !== null ? `Â£${price.toFixed(2)}` : null,
     currency: "GBP",
     unit_price: null,
     unit_price_value: null,
@@ -740,7 +852,7 @@ function titleTag(html: string): string | null {
 function firstMatch(html: string, re: RegExp): string | null {
   const match = re.exec(html);
   if (!match) return null;
-  return match[0].replace(/&pound;/gi, "£");
+  return match[0].replace(/&pound;/gi, "Â£");
 }
 
 function decodeHtml(value: string | null): string | null {
@@ -749,7 +861,7 @@ function decodeHtml(value: string | null): string | null {
     .replace(/&amp;/g, "&")
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
-    .replace(/&pound;/g, "£")
+    .replace(/&pound;/g, "Â£")
     .replace(/\s+/g, " ")
     .trim();
 }

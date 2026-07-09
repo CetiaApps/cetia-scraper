@@ -5,7 +5,9 @@ import {
   type TescoProductPageInput,
   type TescoProductPageItem,
   type TescoProductPageError,
+  type TescoProductPageScrapeStats,
 } from "../crawlers/tescoProductPageCrawler.js";
+import { getTescoProductFetchMode, type BrightDataFetchMode } from "./brightdata.js";
 
 const SUPERMARKET_CODE = "tesco";
 const SUPERMARKET_NAME = "Tesco";
@@ -28,10 +30,12 @@ export interface TescoWorkerInput {
   max_concurrency?: unknown;
   max_runtime_seconds?: unknown;
   allow_render_fallback?: unknown;
+  fetch_mode?: unknown;
   write_to_productscrapped?: unknown;
   stop_when_no_pages?: unknown;
   adopt_global_pending_pages?: unknown;
   force?: unknown;
+  debug?: unknown;
 }
 
 export interface TescoWorkerResult {
@@ -49,6 +53,7 @@ export interface TescoWorkerResult {
   pending_remaining: number;
   errors_count: number;
   adopted_pages: number;
+  stats: TescoProductPageScrapeStats;
   stopped_reason: "max_runtime_reached" | "no_pages_remaining" | "cancelled" | "error";
   message: string;
 }
@@ -73,8 +78,40 @@ function boolValue(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
 
+function fetchModeValue(value: unknown): BrightDataFetchMode {
+  return ["raw_first", "render_first", "raw_only", "render_only"].includes(String(value))
+    ? (value as BrightDataFetchMode)
+    : getTescoProductFetchMode();
+}
+
+function emptyStats(): TescoProductPageScrapeStats {
+  return {
+    raw_fetch_success: 0,
+    render_fetch_success: 0,
+    producttype_success: 0,
+    jsonld_success: 0,
+    nextdata_success: 0,
+    meta_fallback_success: 0,
+    parse_failed: 0,
+    empty_html: 0,
+    brightdata_retryable_errors: 0,
+  };
+}
+
+function addStats(
+  target: TescoProductPageScrapeStats,
+  source: TescoProductPageScrapeStats | undefined,
+) {
+  if (!source) return;
+  for (const key of Object.keys(target) as Array<keyof TescoProductPageScrapeStats>) {
+    target[key] += Number(source[key] ?? 0);
+  }
+}
+
 function requestTimeoutFromRuntime(maxRuntimeSeconds: number): number {
-  return Math.min(Math.max(Math.floor(maxRuntimeSeconds * 500), 5_000), 45_000);
+  return maxRuntimeSeconds <= 90
+    ? Math.min(Math.max(Math.floor(maxRuntimeSeconds * 500), 5_000), 45_000)
+    : 0;
 }
 
 function safeErrorMessage(value: unknown): string {
@@ -164,51 +201,21 @@ async function refreshRunCounts(
   runId: string,
   patch: Record<string, unknown> = {},
 ) {
-  const statuses = ["pending", "scraping", "scraped", "failed"];
-  const statusCounts = await Promise.all(
-    statuses.map(async (status) => {
-      const { count, error } = await supabase
-        .from("supermarket_page_index")
-        .select("*", { count: "exact", head: true })
-        .eq("supermarket_code", SUPERMARKET_CODE)
-        .eq("run_id", runId)
-        .eq("scrape_status", status);
-      if (error) throw new Error(error.message);
-      return [status, count ?? 0] as const;
-    }),
-  );
-  const counts = Object.fromEntries(statusCounts) as Record<string, number>;
-
-  const [{ count: indexed, error: indexedError }, { count: items, error: itemsError }, { count: errors, error: errorsError }] =
-    await Promise.all([
-      supabase
-        .from("supermarket_page_index")
-        .select("*", { count: "exact", head: true })
-        .eq("supermarket_code", SUPERMARKET_CODE)
-        .eq("run_id", runId),
-      supabase
-        .from("supermarket_item_prices")
-        .select("*", { count: "exact", head: true })
-        .eq("supermarket_code", SUPERMARKET_CODE)
-        .eq("run_id", runId),
-      supabase
-        .from("supermarket_price_scrape_errors")
-        .select("*", { count: "exact", head: true })
-        .eq("run_id", runId),
-    ]);
-
-  if (indexedError) throw new Error(indexedError.message);
-  if (itemsError) throw new Error(itemsError.message);
-  if (errorsError) throw new Error(errorsError.message);
+  const { data, error: rpcError } = await supabase
+    .rpc("refresh_tesco_scrape_run_counts", { p_run_id: runId })
+    .single();
+  if (rpcError) throw new Error(rpcError.message);
+  const counts = data as {
+    pages_indexed: number;
+    pages_pending: number;
+    pages_scraping: number;
+    pages_scraped: number;
+    pages_failed: number;
+    items_upserted: number;
+    errors_count: number;
+  };
 
   const updatePayload = {
-    pages_indexed: indexed ?? 0,
-    pages_pending: counts.pending ?? 0,
-    pages_scraping: counts.scraping ?? 0,
-    pages_scraped: counts.scraped ?? 0,
-    pages_failed: counts.failed ?? 0,
-    items_upserted: items ?? 0,
-    errors_count: errors ?? 0,
     last_heartbeat_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
     ...patch,
@@ -221,13 +228,13 @@ async function refreshRunCounts(
   if (error) throw new Error(error.message);
 
   return {
-    indexed: indexed ?? 0,
-    pending: counts.pending ?? 0,
-    scraping: counts.scraping ?? 0,
-    scraped: counts.scraped ?? 0,
-    failed: counts.failed ?? 0,
-    items: items ?? 0,
-    errors: errors ?? 0,
+    indexed: counts.pages_indexed ?? 0,
+    pending: counts.pages_pending ?? 0,
+    scraping: counts.pages_scraping ?? 0,
+    scraped: counts.pages_scraped ?? 0,
+    failed: counts.pages_failed ?? 0,
+    items: counts.items_upserted ?? 0,
+    errors: counts.errors_count ?? 0,
   };
 }
 
@@ -298,6 +305,17 @@ async function claimPages(
   batchSize: number,
   scope: "run" | "global" = "run",
 ): Promise<WorkerPage[]> {
+  if (scope === "run") {
+    const { data, error } = await supabase.rpc("claim_tesco_product_pages", {
+      p_run_id: runId,
+      p_batch_size: batchSize,
+      p_worker_id: workerId,
+      p_stale_after_minutes: STALE_CLAIM_MINUTES,
+    });
+    if (error) throw new Error(error.message);
+    return (data ?? []) as WorkerPage[];
+  }
+
   const now = new Date().toISOString();
   let query = supabase
     .from("supermarket_page_index")
@@ -307,10 +325,6 @@ async function claimPages(
     .or(`next_scrape_after.is.null,next_scrape_after.lte.${now}`)
     .order("updated_at", { ascending: true })
     .limit(batchSize * 5);
-
-  if (scope === "run") {
-    query = query.eq("run_id", runId);
-  }
 
   const { data, error } = await query;
 
@@ -389,6 +403,8 @@ async function processBatch(
   pages: WorkerPage[],
   maxConcurrency: number,
   allowRenderFallback: boolean,
+  fetchMode: BrightDataFetchMode,
+  debug: boolean,
   writeToProductscrapped: boolean,
   requestTimeoutMs: number,
 ) {
@@ -399,8 +415,12 @@ async function processBatch(
   }));
 
   // Bright Data is called once per Tesco URL inside scrapeTescoProductPages.
-  const scrapeResult = await scrapeTescoProductPages(scrapeInputs, maxConcurrency, {
-    allowRenderFallback,
+  const scrapeResult = await scrapeTescoProductPages({
+    pages: scrapeInputs,
+    max_concurrency: maxConcurrency,
+    allow_render_fallback: allowRenderFallback,
+    fetch_mode: fetchMode,
+    debug,
     requestTimeoutMs,
   });
   const pagesByUrl = new Map(pages.map((page) => [page.page_url, page]));
@@ -499,6 +519,7 @@ async function processBatch(
     itemsUpserted,
     productscrappedWritten,
     errorsReturned: scrapeResult.errors.length,
+    stats: scrapeResult.stats,
     elapsedMs: Date.now() - startedAt,
   };
 }
@@ -526,12 +547,14 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
   // The batch size controls how many Supabase page rows are claimed per loop.
   const maxConcurrency = clampInt(input.max_concurrency, 2, 1, 5);
   // max_concurrency controls how many Bright Data requests are in flight at once.
-  const maxRuntimeSeconds = clampInt(input.max_runtime_seconds, 120, 10, 240);
+  const maxRuntimeSeconds = clampInt(input.max_runtime_seconds, 600, 30, 1800);
   const requestTimeoutMs = requestTimeoutFromRuntime(maxRuntimeSeconds);
   const allowRenderFallback = boolValue(input.allow_render_fallback, true);
+  const fetchMode = fetchModeValue(input.fetch_mode);
   const writeToProductscrapped = boolValue(input.write_to_productscrapped, false);
   const stopWhenNoPages = boolValue(input.stop_when_no_pages, true);
   const adoptGlobalPendingPages = boolValue(input.adopt_global_pending_pages, true);
+  const debug = boolValue(input.debug, false);
   const force = input.force === true;
   const workerId = `tesco-railway-worker-${randomUUID()}`;
   const startedAt = new Date();
@@ -550,6 +573,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
   let lastError: string | null = null;
   let pendingRemaining = 0;
   let errorsCount = 0;
+  const stats = emptyStats();
 
   console.log("[tescoPageWorker] Worker start", {
     run_id: runId,
@@ -559,6 +583,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     max_runtime_seconds: maxRuntimeSeconds,
     request_timeout_ms: requestTimeoutMs,
     allow_render_fallback: allowRenderFallback,
+    fetch_mode: fetchMode,
     write_to_productscrapped: writeToProductscrapped,
     adopt_global_pending_pages: adoptGlobalPendingPages,
   });
@@ -659,6 +684,8 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
           pages,
           maxConcurrency,
           allowRenderFallback,
+          fetchMode,
+          debug,
           writeToProductscrapped,
           requestTimeoutMs,
         );
@@ -670,6 +697,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
       pagesFailed += batch.failed;
       itemsUpserted += batch.itemsUpserted;
       productscrappedWritten += batch.productscrappedWritten;
+      addStats(stats, batch.stats);
 
       const existingProductScrappedWrites = Number(run.items_written_to_productscrapped ?? 0);
       const counts = await refreshRunCounts(supabase, runId, {
@@ -691,6 +719,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
         pages_failed: batch.failed,
         items_upserted: batch.itemsUpserted,
         productscrapped_written: batch.productscrappedWritten,
+        stats: batch.stats,
         elapsed_ms: batch.elapsedMs,
       });
     }
@@ -747,6 +776,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     pending_remaining: pendingRemaining,
     errors_count: errorsCount,
     adopted_pages: adoptedPages,
+    stats,
     stopped_reason: stoppedReason,
     message: `Railway worker stopped: ${stoppedReason}`,
   };

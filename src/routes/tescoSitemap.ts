@@ -5,10 +5,6 @@ import {
   scrapeTescoProductPages,
   type TescoProductPageInput,
 } from "../crawlers/tescoProductPageCrawler.js";
-import {
-  runTescoPageWorker,
-  WorkerAlreadyRunningError,
-} from "../services/tescoPageWorker.js";
 
 export const tescoSitemapRouter = Router();
 
@@ -80,9 +76,13 @@ tescoSitemapRouter.post(
       }
 
       const maxConcurrency = Number(body.max_concurrency) || 2;
-      const allowRenderFallback = body.allow_render_fallback === true;
-      const result = await scrapeTescoProductPages(pages, maxConcurrency, {
-        allowRenderFallback,
+      const allowRenderFallback = body.allow_render_fallback !== false;
+      const result = await scrapeTescoProductPages({
+        pages,
+        max_concurrency: maxConcurrency,
+        allow_render_fallback: allowRenderFallback,
+        fetch_mode: body.fetch_mode,
+        debug: body.debug === true,
       });
 
       res.json({
@@ -92,6 +92,7 @@ tescoSitemapRouter.post(
         errors: result.errors,
         scraped: result.items.length,
         failed: result.errors.length,
+        stats: result.stats,
         allow_render_fallback: allowRenderFallback,
       });
     } catch (error) {
@@ -111,71 +112,6 @@ tescoSitemapRouter.post(
         ],
         scraped: 0,
         failed: 1,
-      });
-    }
-  },
-);
-
-tescoSitemapRouter.post(
-  "/scrape/tesco/run-worker",
-  requireApiKey,
-  async (req, res) => {
-    try {
-      const body = req.body ?? {};
-      const detached = body.detached === true || body.async === true;
-
-      if (detached) {
-        const runId = typeof body.run_id === "string" ? body.run_id.trim() : "";
-        if (!runId) {
-          res.status(400).json({
-            success: false,
-            ok: false,
-            error: "run_id is required",
-          });
-          return;
-        }
-
-        void runTescoPageWorker(body).catch((error) => {
-          console.error("[tescoSitemap] Detached Tesco worker failed", {
-            run_id: runId,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        });
-
-        res.status(202).json({
-          success: true,
-          ok: true,
-          run_id: runId,
-          detached: true,
-          message:
-            "Railway Tesco worker started in detached mode; poll Supabase run status for progress.",
-        });
-        return;
-      }
-
-      const result = await runTescoPageWorker(body);
-      res.json({
-        success: true,
-        ok: true,
-        ...result,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (error instanceof WorkerAlreadyRunningError) {
-        res.status(409).json({
-          success: false,
-          ok: false,
-          error: message,
-          active_pages: error.activePages,
-        });
-        return;
-      }
-
-      const status = /run_id is required/i.test(message) ? 400 : 500;
-      res.status(status).json({
-        success: false,
-        ok: false,
-        error: message,
       });
     }
   },
