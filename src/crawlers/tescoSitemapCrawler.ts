@@ -68,7 +68,7 @@ export async function indexTescoSitemap(input: {
   max_depth?: unknown;
   offset?: unknown;
 }): Promise<TescoSitemapIndexResult> {
-  const maxPages = Math.min(Math.max(Number(input.max_pages) || 100, 1), 40000);
+  const maxPages = Math.min(Math.max(Number(input.max_pages) || 100, 1), 60000);
   const maxDepth = Math.min(Math.max(Number(input.max_depth) || 2, 0), 5);
   const offset = Math.min(Math.max(Number(input.offset) || 0, 0), 100000);
   const queue = cleanSitemaps(input.sitemap_urls).map((url) => ({
