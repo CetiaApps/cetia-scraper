@@ -91,18 +91,20 @@ export async function indexTescoSitemap(input: {
       const response = await fetchViaBrightData(current.url);
 
       if (!response.ok) {
+        const responseBody = response.html ?? response.body ?? "";
         errors.push({
           url: current.url,
           http_status: response.status,
           error_code: "BRIGHTDATA_SITEMAP_FETCH_ERROR",
-          error_message: `Bright Data sitemap fetch failed with HTTP ${response.status}: ${response.body.slice(0, 500)}`,
+          error_message: `Bright Data sitemap fetch failed with HTTP ${response.status}: ${responseBody.slice(0, 500)}`,
         });
         continue;
       }
 
       processed += 1;
+      const responseBody = response.html ?? response.body ?? "";
 
-      for (const loc of extractLocs(response.body)) {
+      for (const loc of extractLocs(responseBody)) {
         if (pages.size >= maxPages) break;
         const absoluteUrl = absoluteTescoUrl(loc);
         if (!absoluteUrl) continue;
