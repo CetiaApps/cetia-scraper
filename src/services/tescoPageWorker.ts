@@ -123,6 +123,14 @@ function backoffMinutes(attemptCount: number): number {
   return Math.min(180, Math.max(5, 5 * 2 ** Math.max(0, attemptCount - 1)));
 }
 
+function chunkArray<T>(values: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+}
+
 function productScrappedPayload(
   item: TescoProductPageItem,
   runId: string,
@@ -426,6 +434,9 @@ async function processBatch(
   const pagesByUrl = new Map(pages.map((page) => [page.page_url, page]));
   const errorsByUrl = new Map(scrapeResult.errors.map((error) => [error.product_url, error]));
   const successfulUrls = new Set<string>();
+  const successfulPageIds: string[] = [];
+  const pricePayloads: Record<string, unknown>[] = [];
+  const productscrappedPayloads: Record<string, unknown>[] = [];
   let itemsUpserted = 0;
   let productscrappedWritten = 0;
 
@@ -444,50 +455,96 @@ async function processBatch(
       updated_at: now,
     };
 
-    const { error } = await supabase
-      .from("supermarket_item_prices")
-      .upsert(payload, { onConflict: "supermarket_code,product_url" });
-
-    if (error) {
-      await logScrapeError(supabase, {
-        runId,
-        pageIndexId: page?.id ?? null,
-        url: item.product_url,
-        phase: "price_upsert",
-        code: "PRICE_UPSERT_FAILED",
-        message: error.message,
-      });
-      continue;
-    }
-
-    itemsUpserted++;
+    pricePayloads.push(payload);
     successfulUrls.add(item.product_url);
+    if (page?.id) successfulPageIds.push(page.id);
 
     if (writeToProductscrapped) {
-      const { error: writeError } = await supabase
-        .from("productscrapped")
-        .insert(productScrappedPayload(item, runId, page));
-      if (writeError) {
-        await logScrapeError(supabase, {
-          runId,
-          pageIndexId: page?.id ?? null,
-          url: item.product_url,
-          phase: "productscrapped_write",
-          code: "PRODUCTSCRAPPED_WRITE_FAILED",
-          message: writeError.message,
-        });
-      } else {
-        productscrappedWritten++;
-      }
+      productscrappedPayloads.push(productScrappedPayload(item, runId, page));
     }
   }
 
-  let scraped = 0;
-  let failed = 0;
+  if (pricePayloads.length > 0) {
+    const { error } = await supabase
+      .from("supermarket_item_prices")
+      .upsert(pricePayloads, { onConflict: "supermarket_code,product_url" });
 
-  for (const page of pages) {
-    if (successfulUrls.has(page.page_url)) {
-      scraped++;
+    if (error) {
+      console.warn("[tescoPageWorker] Bulk price upsert failed; retrying per row", {
+        run_id: runId,
+        rows: pricePayloads.length,
+        code: error.code,
+        message: error.message,
+      });
+
+      successfulUrls.clear();
+      successfulPageIds.length = 0;
+      for (const payload of pricePayloads) {
+        const productUrl = String(payload.product_url ?? "");
+        const page = pagesByUrl.get(productUrl);
+        const { error: rowError } = await supabase
+          .from("supermarket_item_prices")
+          .upsert(payload, { onConflict: "supermarket_code,product_url" });
+
+        if (rowError) {
+          await logScrapeError(supabase, {
+            runId,
+            pageIndexId: page?.id ?? null,
+            url: productUrl,
+            phase: "price_upsert",
+            code: "PRICE_UPSERT_FAILED",
+            message: rowError.message,
+          });
+          continue;
+        }
+
+        itemsUpserted++;
+        successfulUrls.add(productUrl);
+        if (page?.id) successfulPageIds.push(page.id);
+      }
+    } else {
+      itemsUpserted = pricePayloads.length;
+    }
+  }
+
+  const productscrappedRowsToWrite = productscrappedPayloads.filter((payload) =>
+    successfulUrls.has(String(payload.product_url ?? "")),
+  );
+
+  if (writeToProductscrapped && productscrappedRowsToWrite.length > 0) {
+    const { error } = await supabase.from("productscrapped").insert(productscrappedRowsToWrite);
+    if (error) {
+      console.warn("[tescoPageWorker] Bulk productscrapped insert failed; retrying per row", {
+        run_id: runId,
+        rows: productscrappedRowsToWrite.length,
+        code: error.code,
+        message: error.message,
+      });
+
+      for (const payload of productscrappedRowsToWrite) {
+        const productUrl = String(payload.product_url ?? "");
+        const page = pagesByUrl.get(productUrl);
+        const { error: writeError } = await supabase.from("productscrapped").insert(payload);
+        if (writeError) {
+          await logScrapeError(supabase, {
+            runId,
+            pageIndexId: page?.id ?? null,
+            url: productUrl,
+            phase: "productscrapped_write",
+            code: "PRODUCTSCRAPPED_WRITE_FAILED",
+            message: writeError.message,
+          });
+        } else {
+          productscrappedWritten++;
+        }
+      }
+    } else {
+      productscrappedWritten = productscrappedRowsToWrite.length;
+    }
+  }
+
+  if (successfulPageIds.length > 0) {
+    for (const idChunk of chunkArray(successfulPageIds, 100)) {
       const { error } = await supabase
         .from("supermarket_page_index")
         .update({
@@ -498,9 +555,25 @@ async function processBatch(
           claimed_by: null,
           updated_at: new Date().toISOString(),
         })
-        .eq("id", page.id);
-      if (error) throw new Error(error.message);
-    } else {
+        .in("id", idChunk);
+      if (error) {
+        await logScrapeError(supabase, {
+          runId,
+          phase: "page_status_update",
+          code: "PAGE_STATUS_BULK_UPDATE_FAILED",
+          message: error.message,
+          metadata: { page_ids: idChunk },
+        });
+        throw new Error(error.message);
+      }
+    }
+  }
+
+  const scraped = successfulPageIds.length;
+  let failed = 0;
+
+  for (const page of pages) {
+    if (!successfulUrls.has(page.page_url)) {
       failed++;
       await markPageFailed(
         supabase,
