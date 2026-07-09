@@ -5,6 +5,10 @@ import {
   scrapeTescoProductPages,
   type TescoProductPageInput,
 } from "../crawlers/tescoProductPageCrawler.js";
+import {
+  runTescoPageWorker,
+  WorkerAlreadyRunningError,
+} from "../services/tescoPageWorker.js";
 
 export const tescoSitemapRouter = Router();
 
@@ -107,6 +111,39 @@ tescoSitemapRouter.post(
         ],
         scraped: 0,
         failed: 1,
+      });
+    }
+  },
+);
+
+tescoSitemapRouter.post(
+  "/scrape/tesco/run-worker",
+  requireApiKey,
+  async (req, res) => {
+    try {
+      const result = await runTescoPageWorker(req.body ?? {});
+      res.json({
+        success: true,
+        ok: true,
+        ...result,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof WorkerAlreadyRunningError) {
+        res.status(409).json({
+          success: false,
+          ok: false,
+          error: message,
+          active_pages: error.activePages,
+        });
+        return;
+      }
+
+      const status = /run_id is required/i.test(message) ? 400 : 500;
+      res.status(status).json({
+        success: false,
+        ok: false,
+        error: message,
       });
     }
   },
