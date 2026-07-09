@@ -249,6 +249,26 @@ async function resetStalePages(supabase: SupabaseClient, runId: string): Promise
   return data?.length ?? 0;
 }
 
+async function resetActivePages(supabase: SupabaseClient, runId: string): Promise<number> {
+  const { data, error } = await supabase
+    .from("supermarket_page_index")
+    .update({
+      scrape_status: "pending",
+      claimed_at: null,
+      claimed_by: null,
+      last_error: "Reset active Tesco worker claim by recovery request",
+      updated_at: new Date().toISOString(),
+    })
+    .eq("supermarket_code", SUPERMARKET_CODE)
+    .eq("run_id", runId)
+    .eq("scrape_status", "scraping")
+    .is("last_scraped_at", null)
+    .select("id");
+
+  if (error) throw new Error(error.message);
+  return data?.length ?? 0;
+}
+
 async function activeClaimCount(supabase: SupabaseClient, runId: string): Promise<number> {
   const activeSince = new Date(Date.now() - STALE_CLAIM_MINUTES * 60_000).toISOString();
   const { count, error } = await supabase
@@ -518,6 +538,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
   let itemsUpserted = 0;
   let productscrappedWritten = 0;
   let adoptedPages = 0;
+  let recoveredActivePages = 0;
   let stoppedReason: TescoWorkerResult["stopped_reason"] = "max_runtime_reached";
   let lastError: string | null = null;
   let pendingRemaining = 0;
@@ -544,6 +565,14 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
   await resetStalePages(supabase, runId);
   const activePages = await activeClaimCount(supabase, runId);
   if (activePages > 0 && !force) throw new WorkerAlreadyRunningError(activePages);
+  if (activePages > 0 && force) {
+    recoveredActivePages = await resetActivePages(supabase, runId);
+    console.log("[tescoPageWorker] Recovered active Tesco page claims", {
+      run_id: runId,
+      worker_id: workerId,
+      recovered_active_pages: recoveredActivePages,
+    });
+  }
 
   await supabase
     .from("supermarket_price_scrape_runs")
@@ -551,7 +580,10 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
       status: "scraping",
       phase: "railway_worker",
       last_heartbeat_at: new Date().toISOString(),
-      last_message: "Railway Tesco product page worker started",
+      last_message:
+        recoveredActivePages > 0
+          ? `Railway worker recovered ${recoveredActivePages} active page claim(s) and started`
+          : "Railway Tesco product page worker started",
       updated_at: new Date().toISOString(),
     })
     .eq("id", runId);
