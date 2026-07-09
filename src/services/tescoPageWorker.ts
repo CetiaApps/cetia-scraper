@@ -73,6 +73,10 @@ function boolValue(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
 
+function requestTimeoutFromRuntime(maxRuntimeSeconds: number): number {
+  return Math.min(Math.max(Math.floor(maxRuntimeSeconds * 500), 5_000), 45_000);
+}
+
 function safeErrorMessage(value: unknown): string {
   const message = value instanceof Error ? value.message : String(value);
   return message.slice(0, 1000);
@@ -386,6 +390,7 @@ async function processBatch(
   maxConcurrency: number,
   allowRenderFallback: boolean,
   writeToProductscrapped: boolean,
+  requestTimeoutMs: number,
 ) {
   const startedAt = Date.now();
   const scrapeInputs: TescoProductPageInput[] = pages.map((page) => ({
@@ -396,6 +401,7 @@ async function processBatch(
   // Bright Data is called once per Tesco URL inside scrapeTescoProductPages.
   const scrapeResult = await scrapeTescoProductPages(scrapeInputs, maxConcurrency, {
     allowRenderFallback,
+    requestTimeoutMs,
   });
   const pagesByUrl = new Map(pages.map((page) => [page.page_url, page]));
   const errorsByUrl = new Map(scrapeResult.errors.map((error) => [error.product_url, error]));
@@ -520,7 +526,8 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
   // The batch size controls how many Supabase page rows are claimed per loop.
   const maxConcurrency = clampInt(input.max_concurrency, 2, 1, 5);
   // max_concurrency controls how many Bright Data requests are in flight at once.
-  const maxRuntimeSeconds = clampInt(input.max_runtime_seconds, 600, 30, 1800);
+  const maxRuntimeSeconds = clampInt(input.max_runtime_seconds, 120, 10, 240);
+  const requestTimeoutMs = requestTimeoutFromRuntime(maxRuntimeSeconds);
   const allowRenderFallback = boolValue(input.allow_render_fallback, true);
   const writeToProductscrapped = boolValue(input.write_to_productscrapped, false);
   const stopWhenNoPages = boolValue(input.stop_when_no_pages, true);
@@ -550,6 +557,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     batch_size: batchSize,
     max_concurrency: maxConcurrency,
     max_runtime_seconds: maxRuntimeSeconds,
+    request_timeout_ms: requestTimeoutMs,
     allow_render_fallback: allowRenderFallback,
     write_to_productscrapped: writeToProductscrapped,
     adopt_global_pending_pages: adoptGlobalPendingPages,
@@ -590,6 +598,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
 
   try {
     while (Date.now() < deadline) {
+      if (deadline - Date.now() < 1000) break;
       const { data: freshRun, error } = await supabase
         .from("supermarket_price_scrape_runs")
         .select("status")
@@ -651,6 +660,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
           maxConcurrency,
           allowRenderFallback,
           writeToProductscrapped,
+          requestTimeoutMs,
         );
       } catch (error) {
         await releaseClaimedPagesAfterBatchError(supabase, runId, pages, error);

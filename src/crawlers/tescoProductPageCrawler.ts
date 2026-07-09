@@ -57,6 +57,7 @@ export interface TescoProductPageError {
 
 export interface TescoProductPageScrapeOptions {
   allowRenderFallback?: boolean;
+  requestTimeoutMs?: number;
 }
 
 interface TescoEmbeddedProduct {
@@ -204,7 +205,9 @@ async function fetchTescoProductPage(
   page: TescoProductPageInput,
   options: TescoProductPageScrapeOptions,
 ): Promise<BrightDataFetchResult> {
-  const rawResponse = await fetchViaBrightData(page.page_url);
+  const rawResponse = await fetchViaBrightData(page.page_url, {
+    timeoutMs: options.requestTimeoutMs,
+  });
   if (!options.allowRenderFallback || !shouldRetryWithRenderedFetch(rawResponse)) {
     return rawResponse;
   }
@@ -216,7 +219,10 @@ async function fetchTescoProductPage(
     reason: isEmptyHtml(rawResponse.body) ? "empty_html" : "unusable_html",
   });
 
-  return fetchViaBrightData(page.page_url, { render: true });
+  return fetchViaBrightData(page.page_url, {
+    render: true,
+    timeoutMs: options.requestTimeoutMs,
+  });
 }
 
 function shouldRetryWithRenderedFetch(response: BrightDataFetchResult): boolean {
