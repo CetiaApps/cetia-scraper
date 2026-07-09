@@ -121,7 +121,39 @@ tescoSitemapRouter.post(
   requireApiKey,
   async (req, res) => {
     try {
-      const result = await runTescoPageWorker(req.body ?? {});
+      const body = req.body ?? {};
+      const detached = body.detached === true || body.async === true;
+
+      if (detached) {
+        const runId = typeof body.run_id === "string" ? body.run_id.trim() : "";
+        if (!runId) {
+          res.status(400).json({
+            success: false,
+            ok: false,
+            error: "run_id is required",
+          });
+          return;
+        }
+
+        void runTescoPageWorker(body).catch((error) => {
+          console.error("[tescoSitemap] Detached Tesco worker failed", {
+            run_id: runId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+
+        res.status(202).json({
+          success: true,
+          ok: true,
+          run_id: runId,
+          detached: true,
+          message:
+            "Railway Tesco worker started in detached mode; poll Supabase run status for progress.",
+        });
+        return;
+      }
+
+      const result = await runTescoPageWorker(body);
       res.json({
         success: true,
         ok: true,
