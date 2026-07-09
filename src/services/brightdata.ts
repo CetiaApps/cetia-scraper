@@ -14,15 +14,22 @@ export interface BrightDataFetchResult {
   ok: boolean;
   contentType: string | null;
   body: string;
+  render: boolean;
+}
+
+export interface BrightDataFetchOptions {
+  render?: boolean;
 }
 
 export async function fetchViaBrightData(
   url: string,
+  options: BrightDataFetchOptions = {},
 ): Promise<BrightDataFetchResult> {
   const apiKey = getRequiredEnv("BRIGHTDATA_API_KEY");
   const zone = process.env.BRIGHTDATA_ZONE || "cetiadataservice";
+  const render = options.render === true;
 
-  console.log("[brightdata] Request", { zone, url });
+  console.log("[brightdata] Request", { zone, url, render });
 
   const response = await fetch("https://api.brightdata.com/request", {
     method: "POST",
@@ -34,6 +41,7 @@ export async function fetchViaBrightData(
       zone,
       url,
       format: "raw",
+      ...(render ? { render: "true" } : {}),
     }),
   });
 
@@ -43,6 +51,7 @@ export async function fetchViaBrightData(
     url,
     status: response.status,
     ok: response.ok,
+    render,
     bodyLength: body.length,
   });
 
@@ -52,5 +61,6 @@ export async function fetchViaBrightData(
     ok: response.ok,
     contentType: response.headers.get("content-type"),
     body,
+    render,
   };
 }

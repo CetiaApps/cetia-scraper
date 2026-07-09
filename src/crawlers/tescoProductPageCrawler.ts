@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
-import { fetchViaBrightData } from "../services/brightdata.js";
+import {
+  fetchViaBrightData,
+  type BrightDataFetchResult,
+} from "../services/brightdata.js";
 import {
   absoluteTescoUrl,
   normaliseWhitespace,
@@ -112,7 +115,7 @@ export async function scrapeTescoProductPages(
     while (cursor < pages.length) {
       const page = pages[cursor++];
       try {
-        const response = await fetchViaBrightData(page.page_url);
+        const response = await fetchTescoProductPage(page);
 
         if (!response.ok) {
           errors.push({
@@ -121,6 +124,30 @@ export async function scrapeTescoProductPages(
             http_status: response.status,
             error_code: "BRIGHTDATA_PRODUCT_PAGE_FETCH_ERROR",
             error_message: `Bright Data product page fetch failed with HTTP ${response.status}: ${response.body.slice(0, 500)}`,
+          });
+          continue;
+        }
+
+        if (isEmptyHtml(response.body)) {
+          const productId =
+            page.product_id ?? productIdFromTescoUrl(page.page_url);
+          errors.push({
+            product_url: page.page_url,
+            product_id: productId,
+            http_status: response.status,
+            error_code: "BRIGHTDATA_PRODUCT_PAGE_EMPTY_HTML",
+            error_message:
+              "Bright Data returned HTTP 200 for the Tesco product page but the response body was empty after raw and rendered attempts.",
+            metadata: buildParseDebugMetadata({
+              html: response.body,
+              productId,
+              contentType: response.contentType,
+              httpStatus: response.status,
+              render: response.render,
+              fetchAttempts: response.render
+                ? ["raw", "rendered"]
+                : ["raw"],
+            }),
           });
           continue;
         }
@@ -142,6 +169,10 @@ export async function scrapeTescoProductPages(
               productId,
               contentType: response.contentType,
               httpStatus: response.status,
+              render: response.render,
+              fetchAttempts: response.render
+                ? ["raw", "rendered"]
+                : ["raw"],
             }),
           });
         }
@@ -162,6 +193,44 @@ export async function scrapeTescoProductPages(
   );
 
   return { items, errors };
+}
+
+async function fetchTescoProductPage(
+  page: TescoProductPageInput,
+): Promise<BrightDataFetchResult> {
+  const rawResponse = await fetchViaBrightData(page.page_url);
+  if (!shouldRetryWithRenderedFetch(rawResponse)) return rawResponse;
+
+  console.warn("[tescoProductPageCrawler] Retrying product page with render", {
+    url: page.page_url,
+    status: rawResponse.status,
+    bodyLength: rawResponse.body.length,
+    reason: isEmptyHtml(rawResponse.body) ? "empty_html" : "unusable_html",
+  });
+
+  return fetchViaBrightData(page.page_url, { render: true });
+}
+
+function shouldRetryWithRenderedFetch(response: BrightDataFetchResult): boolean {
+  if (!response.ok) return false;
+  if (response.render) return false;
+  return isEmptyHtml(response.body) || isUnusableProductPageHtml(response.body);
+}
+
+function isEmptyHtml(html: string): boolean {
+  return html.trim().length === 0;
+}
+
+function isUnusableProductPageHtml(html: string): boolean {
+  if (html.length < 1000) return true;
+  return (
+    /access denied|request blocked|forbidden|captcha|unusual traffic|temporarily unavailable/i.test(
+      html,
+    ) &&
+    !/"ProductType:\d+"|application\/ld\+json|id=["']__NEXT_DATA__["']/i.test(
+      html,
+    )
+  );
 }
 
 function extractTescoProductPage(
@@ -194,6 +263,8 @@ function buildParseDebugMetadata(input: {
   productId: string | null;
   contentType: string | null;
   httpStatus: number;
+  render?: boolean;
+  fetchAttempts?: string[];
 }): Record<string, unknown> {
   const { html, productId } = input;
   const productIdPattern = productId
@@ -206,6 +277,8 @@ function buildParseDebugMetadata(input: {
     html_preview: sanitisedHtmlPreview(html),
     content_type: input.contentType,
     response_status: input.httpStatus,
+    render: input.render ?? false,
+    fetch_attempts: input.fetchAttempts ?? ["raw"],
     title_tag: titleTag(html),
     has_price_symbol: /£|&pound;|\bpound\b|\bprice\b/i.test(html),
     has_product_id: productIdPattern ? productIdPattern.test(html) : false,
