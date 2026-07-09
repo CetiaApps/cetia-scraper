@@ -596,6 +596,12 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
 
       loops++;
       pagesClaimed += pages.length;
+      const claimCounts = await refreshRunCounts(supabase, runId, {
+        last_message: `Railway worker batch ${loops}: ${pages.length} page(s) claimed`,
+        last_error: null,
+      });
+      pendingRemaining = claimCounts.pending;
+      errorsCount = claimCounts.errors;
       console.log("[tescoPageWorker] Batch claimed", {
         run_id: runId,
         worker_id: workerId,
