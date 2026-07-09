@@ -76,7 +76,10 @@ tescoSitemapRouter.post(
       }
 
       const maxConcurrency = Number(body.max_concurrency) || 2;
-      const result = await scrapeTescoProductPages(pages, maxConcurrency);
+      const allowRenderFallback = body.allow_render_fallback === true;
+      const result = await scrapeTescoProductPages(pages, maxConcurrency, {
+        allowRenderFallback,
+      });
 
       res.json({
         success: result.errors.length === 0 || result.items.length > 0,
@@ -85,6 +88,7 @@ tescoSitemapRouter.post(
         errors: result.errors,
         scraped: result.items.length,
         failed: result.errors.length,
+        allow_render_fallback: allowRenderFallback,
       });
     } catch (error) {
       res.status(500).json({

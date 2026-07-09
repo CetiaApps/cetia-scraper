@@ -55,6 +55,10 @@ export interface TescoProductPageError {
   metadata?: Record<string, unknown>;
 }
 
+export interface TescoProductPageScrapeOptions {
+  allowRenderFallback?: boolean;
+}
+
 interface TescoEmbeddedProduct {
   id?: string;
   tpnb?: string;
@@ -105,6 +109,7 @@ interface JsonLdProduct {
 export async function scrapeTescoProductPages(
   pages: TescoProductPageInput[],
   maxConcurrency: number,
+  options: TescoProductPageScrapeOptions = {},
 ): Promise<{ items: TescoProductPageItem[]; errors: TescoProductPageError[] }> {
   const concurrency = Math.min(Math.max(Math.floor(maxConcurrency) || 2, 1), 5);
   const items: TescoProductPageItem[] = [];
@@ -115,7 +120,7 @@ export async function scrapeTescoProductPages(
     while (cursor < pages.length) {
       const page = pages[cursor++];
       try {
-        const response = await fetchTescoProductPage(page);
+        const response = await fetchTescoProductPage(page, options);
 
         if (!response.ok) {
           errors.push({
@@ -197,9 +202,12 @@ export async function scrapeTescoProductPages(
 
 async function fetchTescoProductPage(
   page: TescoProductPageInput,
+  options: TescoProductPageScrapeOptions,
 ): Promise<BrightDataFetchResult> {
   const rawResponse = await fetchViaBrightData(page.page_url);
-  if (!shouldRetryWithRenderedFetch(rawResponse)) return rawResponse;
+  if (!options.allowRenderFallback || !shouldRetryWithRenderedFetch(rawResponse)) {
+    return rawResponse;
+  }
 
   console.warn("[tescoProductPageCrawler] Retrying product page with render", {
     url: page.page_url,
