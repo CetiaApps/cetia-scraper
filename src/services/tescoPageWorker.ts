@@ -19,6 +19,7 @@ interface WorkerPage {
   product_id: string | null;
   scrape_attempt_count: number | null;
   max_attempts: number | null;
+  run_id?: string | null;
 }
 
 export interface TescoWorkerInput {
@@ -29,6 +30,7 @@ export interface TescoWorkerInput {
   allow_render_fallback?: unknown;
   write_to_productscrapped?: unknown;
   stop_when_no_pages?: unknown;
+  adopt_global_pending_pages?: unknown;
   force?: unknown;
 }
 
@@ -46,6 +48,7 @@ export interface TescoWorkerResult {
   productscrapped_written: number;
   pending_remaining: number;
   errors_count: number;
+  adopted_pages: number;
   stopped_reason: "max_runtime_reached" | "no_pages_remaining" | "cancelled" | "error";
   message: string;
 }
@@ -260,27 +263,37 @@ async function activeClaimCount(supabase: SupabaseClient, runId: string): Promis
   return count ?? 0;
 }
 
+function eligibleForScrape(page: WorkerPage): boolean {
+  return Number(page.scrape_attempt_count ?? 0) < Number(page.max_attempts ?? 3);
+}
+
 async function claimPages(
   supabase: SupabaseClient,
   runId: string,
   workerId: string,
   batchSize: number,
+  scope: "run" | "global" = "run",
 ): Promise<WorkerPage[]> {
   const now = new Date().toISOString();
-  const { data, error } = await supabase
+  let query = supabase
     .from("supermarket_page_index")
-    .select("id,page_url,product_id,scrape_attempt_count,max_attempts")
+    .select("id,run_id,page_url,product_id,scrape_attempt_count,max_attempts")
     .eq("supermarket_code", SUPERMARKET_CODE)
-    .eq("run_id", runId)
     .in("scrape_status", ["pending", "failed"])
     .or(`next_scrape_after.is.null,next_scrape_after.lte.${now}`)
     .order("updated_at", { ascending: true })
     .limit(batchSize * 5);
 
+  if (scope === "run") {
+    query = query.eq("run_id", runId);
+  }
+
+  const { data, error } = await query;
+
   if (error) throw new Error(error.message);
 
   const pages = ((data ?? []) as WorkerPage[])
-    .filter((page) => Number(page.scrape_attempt_count ?? 0) < Number(page.max_attempts ?? 3))
+    .filter(eligibleForScrape)
     .slice(0, batchSize);
 
   if (pages.length === 0) return [];
@@ -288,6 +301,7 @@ async function claimPages(
   const { data: claimed, error: claimError } = await supabase
     .from("supermarket_page_index")
     .update({
+      run_id: runId,
       scrape_status: "scraping",
       claimed_at: new Date().toISOString(),
       claimed_by: workerId,
@@ -298,7 +312,7 @@ async function claimPages(
       "id",
       pages.map((page) => page.id),
     )
-    .select("id,page_url,product_id,scrape_attempt_count,max_attempts");
+    .select("id,run_id,page_url,product_id,scrape_attempt_count,max_attempts");
 
   if (claimError) throw new Error(claimError.message);
   return (claimed ?? []) as WorkerPage[];
@@ -490,6 +504,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
   const allowRenderFallback = boolValue(input.allow_render_fallback, true);
   const writeToProductscrapped = boolValue(input.write_to_productscrapped, false);
   const stopWhenNoPages = boolValue(input.stop_when_no_pages, true);
+  const adoptGlobalPendingPages = boolValue(input.adopt_global_pending_pages, true);
   const force = input.force === true;
   const workerId = `tesco-railway-worker-${randomUUID()}`;
   const startedAt = new Date();
@@ -502,6 +517,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
   let pagesFailed = 0;
   let itemsUpserted = 0;
   let productscrappedWritten = 0;
+  let adoptedPages = 0;
   let stoppedReason: TescoWorkerResult["stopped_reason"] = "max_runtime_reached";
   let lastError: string | null = null;
   let pendingRemaining = 0;
@@ -515,6 +531,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     max_runtime_seconds: maxRuntimeSeconds,
     allow_render_fallback: allowRenderFallback,
     write_to_productscrapped: writeToProductscrapped,
+    adopt_global_pending_pages: adoptGlobalPendingPages,
   });
 
   const { data: run, error: runError } = await supabase
@@ -553,7 +570,18 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
       }
 
       await resetStalePages(supabase, runId);
-      const pages = await claimPages(supabase, runId, workerId, batchSize);
+      let pages = await claimPages(supabase, runId, workerId, batchSize, "run");
+      if (pages.length === 0 && adoptGlobalPendingPages) {
+        pages = await claimPages(supabase, runId, workerId, batchSize, "global");
+        adoptedPages += pages.length;
+        if (pages.length > 0) {
+          console.log("[tescoPageWorker] Adopted global Tesco pages into run", {
+            run_id: runId,
+            worker_id: workerId,
+            pages_adopted: pages.length,
+          });
+        }
+      }
       if (pages.length === 0) {
         const counts = await refreshRunCounts(supabase, runId, {
           last_message: "Railway worker found no claimable Tesco product pages",
@@ -573,6 +601,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
         worker_id: workerId,
         loop: loops,
         pages_claimed: pages.length,
+        adopted_pages: adoptedPages,
       });
 
       let batch: Awaited<ReturnType<typeof processBatch>>;
@@ -669,6 +698,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     productscrapped_written: productscrappedWritten,
     pending_remaining: pendingRemaining,
     errors_count: errorsCount,
+    adopted_pages: adoptedPages,
     stopped_reason: stoppedReason,
     message: `Railway worker stopped: ${stoppedReason}`,
   };
