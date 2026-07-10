@@ -34,6 +34,8 @@ export interface TescoWorkerInput {
   write_to_productscrapped?: unknown;
   stop_when_no_pages?: unknown;
   adopt_global_pending_pages?: unknown;
+  include_failed?: unknown;
+  recheck_after_days?: unknown;
   force?: unknown;
   debug?: unknown;
 }
@@ -246,9 +248,13 @@ async function refreshRunCounts(
   };
 }
 
-async function resetStalePages(supabase: SupabaseClient, runId: string): Promise<number> {
+async function resetStalePages(
+  supabase: SupabaseClient,
+  runId: string,
+  includeGlobal = false,
+): Promise<number> {
   const staleBefore = new Date(Date.now() - STALE_CLAIM_MINUTES * 60_000).toISOString();
-  const { data, error } = await supabase
+  let query = supabase
     .from("supermarket_page_index")
     .update({
       scrape_status: "pending",
@@ -258,11 +264,13 @@ async function resetStalePages(supabase: SupabaseClient, runId: string): Promise
       updated_at: new Date().toISOString(),
     })
     .eq("supermarket_code", SUPERMARKET_CODE)
-    .eq("run_id", runId)
     .eq("scrape_status", "scraping")
     .is("last_scraped_at", null)
-    .lt("claimed_at", staleBefore)
-    .select("id");
+    .lt("claimed_at", staleBefore);
+
+  if (!includeGlobal) query = query.eq("run_id", runId);
+
+  const { data, error } = await query.select("id");
 
   if (error) throw new Error(error.message);
   return data?.length ?? 0;
@@ -288,15 +296,22 @@ async function resetActivePages(supabase: SupabaseClient, runId: string): Promis
   return data?.length ?? 0;
 }
 
-async function activeClaimCount(supabase: SupabaseClient, runId: string): Promise<number> {
+async function activeClaimCount(
+  supabase: SupabaseClient,
+  runId: string,
+  includeGlobal = false,
+): Promise<number> {
   const activeSince = new Date(Date.now() - STALE_CLAIM_MINUTES * 60_000).toISOString();
-  const { count, error } = await supabase
+  let query = supabase
     .from("supermarket_page_index")
     .select("*", { count: "exact", head: true })
     .eq("supermarket_code", SUPERMARKET_CODE)
-    .eq("run_id", runId)
     .eq("scrape_status", "scraping")
     .gte("claimed_at", activeSince);
+
+  if (!includeGlobal) query = query.eq("run_id", runId);
+
+  const { count, error } = await query;
 
   if (error) throw new Error(error.message);
   return count ?? 0;
@@ -612,6 +627,26 @@ async function releaseClaimedPagesAfterBatchError(
   );
 }
 
+export async function assertTescoPageWorkerCanStart(input: TescoWorkerInput): Promise<void> {
+  const runId = typeof input.run_id === "string" ? input.run_id.trim() : "";
+  if (!runId) throw new Error("run_id is required");
+
+  const adoptGlobalPendingPages = boolValue(input.adopt_global_pending_pages, true);
+  const force = input.force === true;
+  const supabase = createSupabaseServiceClient();
+
+  const { data: run, error: runError } = await supabase
+    .from("supermarket_price_scrape_runs")
+    .select("id")
+    .eq("id", runId)
+    .single();
+  if (runError || !run) throw new Error(runError?.message ?? "Run not found");
+
+  await resetStalePages(supabase, runId, adoptGlobalPendingPages);
+  const activePages = await activeClaimCount(supabase, runId, adoptGlobalPendingPages);
+  if (activePages > 0 && !force) throw new WorkerAlreadyRunningError(activePages);
+}
+
 export async function runTescoPageWorker(input: TescoWorkerInput): Promise<TescoWorkerResult> {
   const runId = typeof input.run_id === "string" ? input.run_id.trim() : "";
   if (!runId) throw new Error("run_id is required");
@@ -668,8 +703,8 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     .single();
   if (runError || !run) throw new Error(runError?.message ?? "Run not found");
 
-  await resetStalePages(supabase, runId);
-  const activePages = await activeClaimCount(supabase, runId);
+  await resetStalePages(supabase, runId, adoptGlobalPendingPages);
+  const activePages = await activeClaimCount(supabase, runId, adoptGlobalPendingPages);
   if (activePages > 0 && !force) throw new WorkerAlreadyRunningError(activePages);
   if (activePages > 0 && force) {
     recoveredActivePages = await resetActivePages(supabase, runId);
@@ -708,7 +743,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
         break;
       }
 
-      await resetStalePages(supabase, runId);
+      await resetStalePages(supabase, runId, adoptGlobalPendingPages);
       let pages = await claimPages(supabase, runId, workerId, batchSize, "run");
       if (pages.length === 0 && adoptGlobalPendingPages) {
         pages = await claimPages(supabase, runId, workerId, batchSize, "global");

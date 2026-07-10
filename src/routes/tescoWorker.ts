@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { requireApiKey } from "../index.js";
 import {
+  assertTescoPageWorkerCanStart,
   runTescoPageWorker,
   WorkerAlreadyRunningError,
 } from "../services/tescoPageWorker.js";
@@ -25,6 +26,8 @@ tescoWorkerRouter.post(
           });
           return;
         }
+
+        await assertTescoPageWorkerCanStart(body);
 
         void runTescoPageWorker(body).catch((error) => {
           console.error("[tescoWorker] Detached Tesco worker failed", {
