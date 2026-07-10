@@ -54,6 +54,9 @@ export interface TescoProductPageError {
   http_status: number | null;
   error_code: string;
   error_message: string;
+  retryable?: boolean;
+  permanent?: boolean;
+  page_outcome?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -91,6 +94,13 @@ export interface TescoProductPageScrapeResult {
   scraped: number;
   failed: number;
   stats: TescoProductPageScrapeStats;
+}
+
+export interface TescoDeadPageDetection {
+  isDeadPage: boolean;
+  markers: string[];
+  reason: string | null;
+  confidence: number;
 }
 
 interface TescoEmbeddedProduct {
@@ -200,6 +210,9 @@ export async function scrapeTescoProductPages(
               (response.error
                 ? `Bright Data product page fetch failed: ${response.error}`
                 : `Bright Data product page fetch failed with HTTP ${response.status}`),
+            retryable: classified?.retryable ?? true,
+            permanent: classified?.permanent ?? false,
+            page_outcome: classified?.page_outcome ?? "network_error",
             metadata: {
               ...buildParseDebugMetadata({
                 html: response.html,
@@ -211,8 +224,18 @@ export async function scrapeTescoProductPages(
                 fetchElapsedMs: response.elapsedMs,
                 brightdataStatus: response.status,
                 debug: scrapeOptions.debug === true,
+                fetchMode: scrapeOptions.fetchMode ?? scrapeOptions.fetch_mode,
               }),
               ...(classified?.metadata ?? {}),
+              ...(classified
+                ? {}
+                : {
+                    page_outcome: "network_error",
+                    outcome: "recoverable_failure",
+                    retryable: true,
+                    terminal: false,
+                    permanent: false,
+                  }),
             },
           });
           continue;
@@ -228,7 +251,10 @@ export async function scrapeTescoProductPages(
             http_status: response.status,
             error_code: "BRIGHTDATA_PRODUCT_PAGE_EMPTY_HTML",
             error_message:
-              "Bright Data returned HTTP 200 for the Tesco product page but the response body was empty after raw and rendered attempts.",
+              "Bright Data returned HTTP 200 for the Tesco product page but the response body was empty.",
+            retryable: true,
+            permanent: false,
+            page_outcome: "brightdata_empty_html",
             metadata: buildParseDebugMetadata({
               html: response.html,
               productId,
@@ -239,6 +265,12 @@ export async function scrapeTescoProductPages(
               fetchElapsedMs: response.elapsedMs,
               brightdataStatus: response.status,
               debug: scrapeOptions.debug === true,
+              fetchMode: scrapeOptions.fetchMode ?? scrapeOptions.fetch_mode,
+              pageOutcome: "brightdata_empty_html",
+              outcome: "recoverable_failure",
+              retryable: true,
+              terminal: false,
+              permanent: false,
             }),
           });
           continue;
@@ -265,6 +297,9 @@ export async function scrapeTescoProductPages(
             error_message:
               classified?.error_message ??
               "Tesco product page was fetched and looks live, but no product/price data could be extracted.",
+            retryable: classified?.retryable ?? true,
+            permanent: classified?.permanent ?? false,
+            page_outcome: classified?.page_outcome ?? "parse_error",
             metadata: {
               ...buildParseDebugMetadata({
                 html: response.html,
@@ -276,6 +311,15 @@ export async function scrapeTescoProductPages(
                 fetchElapsedMs: response.elapsedMs,
                 brightdataStatus: response.status,
                 debug: scrapeOptions.debug === true,
+                fetchMode: scrapeOptions.fetchMode ?? scrapeOptions.fetch_mode,
+                pageOutcome: classified?.page_outcome ?? "parse_error",
+                outcome:
+                  typeof classified?.metadata?.outcome === "string"
+                    ? classified.metadata.outcome
+                    : "recoverable_failure",
+                retryable: classified?.retryable ?? true,
+                terminal: classified?.permanent ?? false,
+                permanent: classified?.permanent ?? false,
               }),
               ...(classified?.metadata ?? {}),
             },
@@ -363,38 +407,73 @@ function isUnusableProductPageHtml(html: string): boolean {
   );
 }
 
+function normaliseHtmlText(html: string): string {
+  return (html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+export function detectTescoDeadProductPage(html: string): TescoDeadPageDetection {
+  const text = normaliseHtmlText(html);
+  const markers: string[] = [];
+
+  if (text.includes("not down this aisle")) markers.push("not down this aisle");
+  if (text.includes("looks like that page is missing")) markers.push("looks like that page is missing");
+  if (text.includes("try checking the url for errors")) markers.push("try checking the url for errors");
+  if (text.includes("back to home")) markers.push("back to home");
+
+  const hasPrimary =
+    text.includes("not down this aisle") ||
+    text.includes("looks like that page is missing");
+  const hasSupporting =
+    text.includes("try checking the url for errors") ||
+    text.includes("back to home");
+  const isDeadPage = hasPrimary && (hasSupporting || markers.length >= 2);
+
+  return {
+    isDeadPage,
+    markers,
+    reason: isDeadPage
+      ? "Tesco returned missing product page / Not down this aisle"
+      : null,
+    confidence: isDeadPage && hasSupporting ? 0.98 : isDeadPage ? 0.9 : 0,
+  };
+}
+
 function classifyTescoFailureHtml(
   html: string,
-  httpStatus: number,
+  _httpStatus: number,
 ): {
   error_code: string;
   error_message: string;
+  retryable: boolean;
+  permanent: boolean;
+  page_outcome: string;
   metadata: Record<string, unknown>;
 } | null {
-  const text = normaliseWhitespace(
-    html
-      .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
-      .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
-      .replace(/<[^>]+>/g, " "),
-  )?.toLowerCase();
-
-  const deadSignals = [
-    /not down this aisle/i,
-    /looks like that page is missing/i,
-    /try checking the url for errors/i,
-    /return to the home page/i,
-    /back to home/i,
-    /page not found/i,
-  ];
-  if (httpStatus === 404 || deadSignals.some((pattern) => pattern.test(html) || pattern.test(text ?? ""))) {
+  const text = normaliseHtmlText(html);
+  const deadPage = detectTescoDeadProductPage(html);
+  if (deadPage.isDeadPage) {
     return {
       error_code: "TESCO_PRODUCT_PAGE_DEAD",
       error_message:
-        "Tesco returned a missing-page response for this product URL. The page is treated as dead and will not be retried.",
+        "Tesco returned a missing product page: Not down this aisle.",
+      retryable: false,
+      permanent: true,
+      page_outcome: "dead_product_page",
       metadata: {
-        outcome: "dead_page",
+        page_outcome: "dead_product_page",
+        outcome: "permanent_failure",
         terminal: true,
         retryable: false,
+        permanent: true,
+        has_dead_page_text: true,
+        dead_page_markers: deadPage.markers,
+        dead_page_confidence: deadPage.confidence,
         detected_by: "tesco_missing_page_text",
       },
     };
@@ -402,17 +481,22 @@ function classifyTescoFailureHtml(
 
   if (
     /cookie|consent|privacy preferences|onetrust|trustarc|accept all|access denied|request blocked|forbidden|captcha|unusual traffic|temporarily unavailable|verify you are human|security check/i.test(
-      html,
+      text,
     )
   ) {
     return {
       error_code: "TESCO_PRODUCT_PAGE_CONSENT_OR_BLOCK",
       error_message:
         "Tesco product page fetch returned a consent, block, cookie, or bot-check page instead of product data.",
+      retryable: true,
+      permanent: false,
+      page_outcome: "blocked_or_consent",
       metadata: {
-        outcome: "consent_or_block",
+        page_outcome: "blocked_or_consent",
+        outcome: "recoverable_failure",
         terminal: false,
         retryable: true,
+        permanent: false,
         detected_by: "consent_block_text",
       },
     };
@@ -456,12 +540,19 @@ function buildParseDebugMetadata(input: {
   fetchElapsedMs?: number;
   brightdataStatus?: number;
   debug?: boolean;
+  fetchMode?: BrightDataFetchMode;
+  pageOutcome?: string;
+  outcome?: string;
+  retryable?: boolean;
+  terminal?: boolean;
+  permanent?: boolean;
 }): Record<string, unknown> {
   const { html, productId } = input;
   const productIdPattern = productId
     ? new RegExp(productId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
     : null;
   const hasJsonLd = /application\/ld\+json/i.test(html);
+  const deadPage = detectTescoDeadProductPage(html);
   const metadata: Record<string, unknown> = {
     html_length: html.length,
     html_sha256: createHash("sha256").update(html).digest("hex"),
@@ -486,6 +577,8 @@ function buildParseDebugMetadata(input: {
       /access denied|request blocked|forbidden|captcha|unusual traffic|temporarily unavailable/i.test(
         html,
       ),
+    has_dead_page_text: deadPage.isDeadPage,
+    dead_page_markers: deadPage.markers,
     has_bot_text:
       /bot|robot|automated|verify you are human|security check|are you a human/i.test(html),
     script_count: (html.match(/<script\b/gi) ?? []).length,
@@ -496,6 +589,12 @@ function buildParseDebugMetadata(input: {
       "__NEXT_DATA__ product object",
       "meta/title/price fallback",
     ],
+    page_outcome: input.pageOutcome ?? "unknown_failure",
+    outcome: input.outcome ?? "recoverable_failure",
+    retryable: input.retryable ?? true,
+    terminal: input.terminal ?? false,
+    permanent: input.permanent ?? false,
+    fetch_mode: input.fetchMode ?? null,
   };
 
   if (input.debug === true || process.env.TESCO_DEBUG_HTML_PREVIEW === "true") {

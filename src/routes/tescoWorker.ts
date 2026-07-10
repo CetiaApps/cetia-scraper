@@ -61,6 +61,8 @@ tescoWorkerRouter.post(
           ok: false,
           error: "worker_already_active",
           active_scraping_pages: error.activePages,
+          active_worker_count: error.activePages,
+          max_active_workers: error.maxActiveWorkers,
           message,
         });
         return;

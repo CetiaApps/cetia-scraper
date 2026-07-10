@@ -35,6 +35,11 @@ export interface TescoWorkerInput {
   stop_when_no_pages?: unknown;
   adopt_global_pending_pages?: unknown;
   include_failed?: unknown;
+  only_recoverable_failed?: unknown;
+  exclude_dead_pages?: unknown;
+  mark_dead_pages_permanent?: unknown;
+  max_active_workers?: unknown;
+  worker_mode?: unknown;
   recheck_after_days?: unknown;
   force?: unknown;
   debug?: unknown;
@@ -63,11 +68,13 @@ export interface TescoWorkerResult {
 
 export class WorkerAlreadyRunningError extends Error {
   activePages: number;
+  maxActiveWorkers: number;
 
-  constructor(activePages: number) {
-    super(`Tesco worker already has ${activePages} active page claim(s) for this run`);
+  constructor(activePages: number, maxActiveWorkers = 1) {
+    super(`Tesco worker already has ${activePages} active worker/page claim(s) for this run`);
     this.name = "WorkerAlreadyRunningError";
     this.activePages = activePages;
+    this.maxActiveWorkers = maxActiveWorkers;
   }
 }
 
@@ -134,6 +141,26 @@ function isDeadPageError(error: TescoProductPageError | null | undefined): boole
 
 function isConsentOrBlockError(error: TescoProductPageError | null | undefined): boolean {
   return error?.error_code === "TESCO_PRODUCT_PAGE_CONSENT_OR_BLOCK";
+}
+
+function pageOutcomeForError(error: TescoProductPageError | null | undefined): string {
+  if (error?.page_outcome) return error.page_outcome;
+  if (error?.error_code === "TESCO_PRODUCT_PAGE_DEAD") return "dead_product_page";
+  if (error?.error_code === "BRIGHTDATA_PRODUCT_PAGE_EMPTY_HTML") return "brightdata_empty_html";
+  if (error?.error_code === "TESCO_PRODUCT_PAGE_CONSENT_OR_BLOCK") return "blocked_or_consent";
+  if (error?.error_code === "TESCO_PRODUCT_PAGE_PARSE_ERROR") return "parse_error";
+  if (/FETCH|NETWORK|BRIGHTDATA/i.test(error?.error_code ?? "")) return "network_error";
+  return "unknown_failure";
+}
+
+function permanentReasonForOutcome(pageOutcome: string): string | null {
+  if (pageOutcome === "dead_product_page") {
+    return "Tesco returned missing product page / Not down this aisle";
+  }
+  if (pageOutcome === "max_attempts_exhausted") {
+    return "Bright Data returned empty HTML after max attempts";
+  }
+  return null;
 }
 
 function chunkArray<T>(values: T[], size: number): T[][] {
@@ -277,6 +304,7 @@ async function resetStalePages(
     })
     .eq("supermarket_code", SUPERMARKET_CODE)
     .eq("scrape_status", "scraping")
+    .eq("permanent_failure", false)
     .is("last_scraped_at", null)
     .lt("claimed_at", staleBefore);
 
@@ -329,6 +357,27 @@ async function activeClaimCount(
   return count ?? 0;
 }
 
+async function activeWorkerCount(
+  supabase: SupabaseClient,
+  runId: string,
+  includeGlobal = false,
+): Promise<number> {
+  const activeSince = new Date(Date.now() - STALE_CLAIM_MINUTES * 60_000).toISOString();
+  let query = supabase
+    .from("supermarket_page_index")
+    .select("claimed_by")
+    .eq("supermarket_code", SUPERMARKET_CODE)
+    .eq("scrape_status", "scraping")
+    .gte("claimed_at", activeSince);
+
+  if (!includeGlobal) query = query.eq("run_id", runId);
+
+  const { data, error } = await query;
+  if (error) throw new Error(error.message);
+
+  return new Set((data ?? []).map((row) => row.claimed_by).filter(Boolean)).size;
+}
+
 function eligibleForScrape(page: WorkerPage): boolean {
   return Number(page.scrape_attempt_count ?? 0) < Number(page.max_attempts ?? 3);
 }
@@ -339,6 +388,11 @@ async function claimPages(
   workerId: string,
   batchSize: number,
   scope: "run" | "global" = "run",
+  options: {
+    includeFailed: boolean;
+    onlyRecoverableFailed: boolean;
+    excludeDeadPages: boolean;
+  },
 ): Promise<WorkerPage[]> {
   if (scope === "run") {
     const { data, error } = await supabase.rpc("claim_tesco_product_pages", {
@@ -346,6 +400,9 @@ async function claimPages(
       p_batch_size: batchSize,
       p_worker_id: workerId,
       p_stale_after_minutes: STALE_CLAIM_MINUTES,
+      p_include_failed: options.includeFailed,
+      p_only_recoverable_failed: options.onlyRecoverableFailed,
+      p_exclude_dead_pages: options.excludeDeadPages,
     });
     if (error) throw new Error(error.message);
     return (data ?? []) as WorkerPage[];
@@ -356,10 +413,25 @@ async function claimPages(
     .from("supermarket_page_index")
     .select("id,run_id,page_url,product_id,scrape_attempt_count,max_attempts")
     .eq("supermarket_code", SUPERMARKET_CODE)
-    .in("scrape_status", ["pending", "failed"])
+    .eq("permanent_failure", false)
+    .in("scrape_status", options.includeFailed ? ["pending", "failed"] : ["pending"])
     .or(`next_scrape_after.is.null,next_scrape_after.lte.${now}`)
     .order("updated_at", { ascending: true })
     .limit(batchSize * 5);
+
+  if (options.excludeDeadPages) {
+    query = query.or("page_outcome.is.null,page_outcome.neq.dead_product_page");
+  }
+
+  if (options.onlyRecoverableFailed) {
+    query = query.in("page_outcome", [
+      "brightdata_empty_html",
+      "network_error",
+      "blocked_or_consent",
+      "parse_error",
+      "unknown_failure",
+    ]);
+  }
 
   const { data, error } = await query;
 
@@ -400,27 +472,50 @@ async function markPageFailed(
 ) {
   const deadPage = isDeadPageError(error);
   const consentOrBlock = isConsentOrBlockError(error);
+  const initialOutcome = pageOutcomeForError(error);
   const nextAttempt = deadPage
     ? Number(page.max_attempts ?? 3)
     : Number(page.scrape_attempt_count ?? 0) + 1;
   const maxAttempts = Number(page.max_attempts ?? 3);
+  const exhausted = !deadPage && nextAttempt >= maxAttempts;
+  const pageOutcome =
+    exhausted && initialOutcome === "brightdata_empty_html"
+      ? "max_attempts_exhausted"
+      : initialOutcome;
+  const permanentFailure = deadPage || pageOutcome === "max_attempts_exhausted";
   const message = (error?.error_message || fallbackMessage).slice(0, 1000);
   const nextScrapeAfter =
-    deadPage || nextAttempt >= maxAttempts
+    permanentFailure || nextAttempt >= maxAttempts
       ? null
       : new Date(Date.now() + backoffMinutes(nextAttempt) * 60_000).toISOString();
+  const metadata = {
+    ...(error?.metadata ?? {}),
+    page_outcome: pageOutcome,
+    outcome: permanentFailure ? "permanent_failure" : "recoverable_failure",
+    terminal: permanentFailure || nextAttempt >= maxAttempts,
+    retryable: !permanentFailure && nextAttempt < maxAttempts,
+    permanent: permanentFailure,
+    scrape_attempt_count: nextAttempt,
+    max_attempts: maxAttempts,
+  };
 
   const { error: updateError } = await supabase
     .from("supermarket_page_index")
     .update({
       scrape_status: "failed",
       scrape_attempt_count: nextAttempt,
+      page_outcome: pageOutcome,
+      permanent_failure: permanentFailure,
+      permanent_failure_reason: permanentReasonForOutcome(pageOutcome),
+      detected_dead_page_at: deadPage ? new Date().toISOString() : null,
+      final_scrape_attempted_at: new Date().toISOString(),
       last_http_status: error?.http_status ?? null,
       last_error: message,
       last_error_at: new Date().toISOString(),
       next_scrape_after: nextScrapeAfter,
       claimed_by: null,
       claimed_at: null,
+      outcome_metadata: metadata,
       updated_at: new Date().toISOString(),
     })
     .eq("id", page.id);
@@ -434,21 +529,12 @@ async function markPageFailed(
     code: error?.error_code ?? "TESCO_WORKER_PAGE_FAILED",
     message,
     metadata: {
-      ...(error?.metadata ?? {}),
-      outcome: deadPage
-        ? "dead_page"
-        : consentOrBlock
-          ? "consent_or_block"
-          : error?.metadata?.outcome ?? "recoverable_failure",
-      terminal: deadPage || nextAttempt >= maxAttempts,
-      retryable: !deadPage && nextAttempt < maxAttempts,
-      scrape_attempt_count: nextAttempt,
-      max_attempts: maxAttempts,
+      ...metadata,
     },
     severity: deadPage ? "info" : consentOrBlock ? "warning" : "error",
   });
 
-  return { terminal: deadPage || nextAttempt >= maxAttempts, deadPage };
+  return { terminal: permanentFailure || nextAttempt >= maxAttempts, deadPage };
 }
 
 async function processBatch(
@@ -596,10 +682,23 @@ async function processBatch(
         .from("supermarket_page_index")
         .update({
           scrape_status: "scraped",
+          page_outcome: "scraped",
+          permanent_failure: false,
+          permanent_failure_reason: null,
+          final_scrape_attempted_at: new Date().toISOString(),
           last_http_status: 200,
           last_scraped_at: new Date().toISOString(),
           last_error: null,
+          next_scrape_after: null,
           claimed_by: null,
+          claimed_at: null,
+          outcome_metadata: {
+            page_outcome: "scraped",
+            outcome: "success",
+            retryable: false,
+            terminal: true,
+            permanent: false,
+          },
           updated_at: new Date().toISOString(),
         })
         .in("id", idChunk);
@@ -667,6 +766,7 @@ export async function assertTescoPageWorkerCanStart(input: TescoWorkerInput): Pr
 
   const adoptGlobalPendingPages = boolValue(input.adopt_global_pending_pages, true);
   const force = input.force === true;
+  const maxActiveWorkers = clampInt(input.max_active_workers, 1, 1, 3);
   const supabase = createSupabaseServiceClient();
 
   const { data: run, error: runError } = await supabase
@@ -677,25 +777,34 @@ export async function assertTescoPageWorkerCanStart(input: TescoWorkerInput): Pr
   if (runError || !run) throw new Error(runError?.message ?? "Run not found");
 
   await resetStalePages(supabase, runId, adoptGlobalPendingPages);
-  const activePages = await activeClaimCount(supabase, runId, adoptGlobalPendingPages);
-  if (activePages > 0 && !force) throw new WorkerAlreadyRunningError(activePages);
+  const activeWorkers = await activeWorkerCount(supabase, runId, adoptGlobalPendingPages);
+  if (activeWorkers >= maxActiveWorkers && !force) {
+    throw new WorkerAlreadyRunningError(activeWorkers, maxActiveWorkers);
+  }
 }
 
 export async function runTescoPageWorker(input: TescoWorkerInput): Promise<TescoWorkerResult> {
   const runId = typeof input.run_id === "string" ? input.run_id.trim() : "";
   if (!runId) throw new Error("run_id is required");
 
-  const batchSize = clampInt(input.batch_size, 10, 1, 50);
+  const workerMode = String(input.worker_mode || "balanced");
+  const fastFirstPass = workerMode === "fast_first_pass";
+  const recoveryPass = workerMode === "recovery_pass";
+  const batchSize = clampInt(input.batch_size, fastFirstPass ? 30 : recoveryPass ? 10 : 20, 1, 100);
   // The batch size controls how many Supabase page rows are claimed per loop.
-  const maxConcurrency = clampInt(input.max_concurrency, 2, 1, 5);
+  const maxConcurrency = clampInt(input.max_concurrency, fastFirstPass ? 5 : recoveryPass ? 2 : 3, 1, 8);
   // max_concurrency controls how many Bright Data requests are in flight at once.
   const maxRuntimeSeconds = clampInt(input.max_runtime_seconds, 600, 30, 1800);
   const requestTimeoutMs = requestTimeoutFromRuntime(maxRuntimeSeconds);
-  const allowRenderFallback = boolValue(input.allow_render_fallback, true);
-  const fetchMode = fetchModeValue(input.fetch_mode);
+  const allowRenderFallback = boolValue(input.allow_render_fallback, !fastFirstPass);
+  const fetchMode = fetchModeValue(input.fetch_mode ?? (fastFirstPass ? "raw_only" : recoveryPass ? "render_first" : "raw_first"));
   const writeToProductscrapped = boolValue(input.write_to_productscrapped, false);
   const stopWhenNoPages = boolValue(input.stop_when_no_pages, true);
   const adoptGlobalPendingPages = boolValue(input.adopt_global_pending_pages, true);
+  const includeFailed = boolValue(input.include_failed, !fastFirstPass);
+  const onlyRecoverableFailed = boolValue(input.only_recoverable_failed, recoveryPass);
+  const excludeDeadPages = boolValue(input.exclude_dead_pages, true);
+  const maxActiveWorkers = clampInt(input.max_active_workers, fastFirstPass ? 2 : 1, 1, 3);
   const debug = boolValue(input.debug, false);
   const force = input.force === true;
   const workerId = `tesco-railway-worker-${randomUUID()}`;
@@ -729,6 +838,11 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     fetch_mode: fetchMode,
     write_to_productscrapped: writeToProductscrapped,
     adopt_global_pending_pages: adoptGlobalPendingPages,
+    include_failed: includeFailed,
+    only_recoverable_failed: onlyRecoverableFailed,
+    exclude_dead_pages: excludeDeadPages,
+    max_active_workers: maxActiveWorkers,
+    worker_mode: workerMode,
   });
 
   const { data: run, error: runError } = await supabase
@@ -739,8 +853,11 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
   if (runError || !run) throw new Error(runError?.message ?? "Run not found");
 
   await resetStalePages(supabase, runId, adoptGlobalPendingPages);
+  const activeWorkers = await activeWorkerCount(supabase, runId, adoptGlobalPendingPages);
+  if (activeWorkers >= maxActiveWorkers && !force) {
+    throw new WorkerAlreadyRunningError(activeWorkers, maxActiveWorkers);
+  }
   const activePages = await activeClaimCount(supabase, runId, adoptGlobalPendingPages);
-  if (activePages > 0 && !force) throw new WorkerAlreadyRunningError(activePages);
   if (activePages > 0 && force) {
     recoveredActivePages = await resetActivePages(supabase, runId);
     console.log("[tescoPageWorker] Recovered active Tesco page claims", {
@@ -779,9 +896,17 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
       }
 
       await resetStalePages(supabase, runId, adoptGlobalPendingPages);
-      let pages = await claimPages(supabase, runId, workerId, batchSize, "run");
+      let pages = await claimPages(supabase, runId, workerId, batchSize, "run", {
+        includeFailed,
+        onlyRecoverableFailed,
+        excludeDeadPages,
+      });
       if (pages.length === 0 && adoptGlobalPendingPages) {
-        pages = await claimPages(supabase, runId, workerId, batchSize, "global");
+        pages = await claimPages(supabase, runId, workerId, batchSize, "global", {
+          includeFailed,
+          onlyRecoverableFailed,
+          excludeDeadPages,
+        });
         adoptedPages += pages.length;
         if (pages.length > 0) {
           console.log("[tescoPageWorker] Adopted global Tesco pages into run", {
