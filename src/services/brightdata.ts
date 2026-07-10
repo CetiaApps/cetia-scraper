@@ -72,6 +72,10 @@ function safeErrorMessage(value: unknown): string {
   return (value instanceof Error ? value.message : String(value)).slice(0, 1000);
 }
 
+function isEmptyResponseBody(value: string): boolean {
+  return value.trim().length === 0;
+}
+
 export async function fetchTescoHtmlViaBrightData(
   url: string,
   options: BrightDataFetchOptions = {},
@@ -132,6 +136,13 @@ export async function fetchTescoHtmlViaBrightData(
         attempt,
         response_bytes: html.length,
       });
+
+      if (response.ok && isEmptyResponseBody(html) && attempt <= maxRetries) {
+        retryableErrors++;
+        lastError = "Bright Data returned HTTP 200 with an empty response body";
+        await delay(backoffMs(attempt, retryBaseDelayMs));
+        continue;
+      }
 
       if (response.ok || !RETRYABLE_STATUSES.has(response.status) || attempt > maxRetries) {
         return {

@@ -221,11 +221,12 @@ export async function scrapeTescoProductPages(
                 httpStatus: response.status,
                 render: response.render,
                 fetchAttempts: [response.render ? "render" : "raw"],
-                fetchElapsedMs: response.elapsedMs,
-                brightdataStatus: response.status,
-                debug: scrapeOptions.debug === true,
-                fetchMode: scrapeOptions.fetchMode ?? scrapeOptions.fetch_mode,
-              }),
+              fetchElapsedMs: response.elapsedMs,
+              brightdataStatus: response.status,
+              debug: scrapeOptions.debug === true,
+              fetchMode: scrapeOptions.fetchMode ?? scrapeOptions.fetch_mode,
+              retryableErrors: response.retryableErrors ?? 0,
+            }),
               ...(classified?.metadata ?? {}),
               ...(classified
                 ? {}
@@ -266,6 +267,7 @@ export async function scrapeTescoProductPages(
               brightdataStatus: response.status,
               debug: scrapeOptions.debug === true,
               fetchMode: scrapeOptions.fetchMode ?? scrapeOptions.fetch_mode,
+              retryableErrors: response.retryableErrors ?? 0,
               pageOutcome: "brightdata_empty_html",
               outcome: "recoverable_failure",
               retryable: true,
@@ -312,6 +314,7 @@ export async function scrapeTescoProductPages(
                 brightdataStatus: response.status,
                 debug: scrapeOptions.debug === true,
                 fetchMode: scrapeOptions.fetchMode ?? scrapeOptions.fetch_mode,
+                retryableErrors: response.retryableErrors ?? 0,
                 pageOutcome: classified?.page_outcome ?? "parse_error",
                 outcome:
                   typeof classified?.metadata?.outcome === "string"
@@ -539,6 +542,7 @@ function buildParseDebugMetadata(input: {
   fetchAttempts?: string[];
   fetchElapsedMs?: number;
   brightdataStatus?: number;
+  retryableErrors?: number;
   debug?: boolean;
   fetchMode?: BrightDataFetchMode;
   pageOutcome?: string;
@@ -562,6 +566,7 @@ function buildParseDebugMetadata(input: {
     fetch_attempts: input.fetchAttempts ?? ["raw"],
     fetch_elapsed_ms: input.fetchElapsedMs ?? null,
     brightdata_status: input.brightdataStatus ?? input.httpStatus,
+    brightdata_retryable_errors: input.retryableErrors ?? 0,
     title_tag: titleTag(html),
     has_price_symbol: /\u00a3|&pound;|\bpound\b|\bprice\b/i.test(html),
     has_product_id: productIdPattern ? productIdPattern.test(html) : false,
