@@ -50,6 +50,7 @@ export interface TescoWorkerResult {
   pages_claimed: number;
   pages_scraped: number;
   pages_failed: number;
+  pages_dead: number;
   items_upserted: number;
   productscrapped_written: number;
   pending_remaining: number;
@@ -94,6 +95,8 @@ function emptyStats(): TescoProductPageScrapeStats {
     jsonld_success: 0,
     nextdata_success: 0,
     meta_fallback_success: 0,
+    dead_page: 0,
+    consent_or_block: 0,
     parse_failed: 0,
     empty_html: 0,
     brightdata_retryable_errors: 0,
@@ -123,6 +126,14 @@ function safeErrorMessage(value: unknown): string {
 
 function backoffMinutes(attemptCount: number): number {
   return Math.min(180, Math.max(5, 5 * 2 ** Math.max(0, attemptCount - 1)));
+}
+
+function isDeadPageError(error: TescoProductPageError | null | undefined): boolean {
+  return error?.error_code === "TESCO_PRODUCT_PAGE_DEAD";
+}
+
+function isConsentOrBlockError(error: TescoProductPageError | null | undefined): boolean {
+  return error?.error_code === "TESCO_PRODUCT_PAGE_CONSENT_OR_BLOCK";
 }
 
 function chunkArray<T>(values: T[], size: number): T[][] {
@@ -181,6 +192,7 @@ async function logScrapeError(
     message: string;
     metadata?: Record<string, unknown>;
     phase?: string;
+    severity?: "info" | "warning" | "error";
   },
 ) {
   const { error } = await supabase.from("supermarket_price_scrape_errors").insert({
@@ -188,7 +200,7 @@ async function logScrapeError(
     page_index_id: input.pageIndexId ?? null,
     supermarket_code: SUPERMARKET_CODE,
     phase: input.phase ?? "scraping",
-    severity: "error",
+    severity: input.severity ?? "error",
     url: input.url ?? null,
     http_status: input.httpStatus ?? null,
     error_code: input.code ?? null,
@@ -386,11 +398,15 @@ async function markPageFailed(
   error: TescoProductPageError | null,
   fallbackMessage: string,
 ) {
-  const nextAttempt = Number(page.scrape_attempt_count ?? 0) + 1;
+  const deadPage = isDeadPageError(error);
+  const consentOrBlock = isConsentOrBlockError(error);
+  const nextAttempt = deadPage
+    ? Number(page.max_attempts ?? 3)
+    : Number(page.scrape_attempt_count ?? 0) + 1;
   const maxAttempts = Number(page.max_attempts ?? 3);
   const message = (error?.error_message || fallbackMessage).slice(0, 1000);
   const nextScrapeAfter =
-    nextAttempt >= maxAttempts
+    deadPage || nextAttempt >= maxAttempts
       ? null
       : new Date(Date.now() + backoffMinutes(nextAttempt) * 60_000).toISOString();
 
@@ -404,6 +420,7 @@ async function markPageFailed(
       last_error_at: new Date().toISOString(),
       next_scrape_after: nextScrapeAfter,
       claimed_by: null,
+      claimed_at: null,
       updated_at: new Date().toISOString(),
     })
     .eq("id", page.id);
@@ -416,8 +433,22 @@ async function markPageFailed(
     httpStatus: error?.http_status ?? null,
     code: error?.error_code ?? "TESCO_WORKER_PAGE_FAILED",
     message,
-    metadata: error?.metadata,
+    metadata: {
+      ...(error?.metadata ?? {}),
+      outcome: deadPage
+        ? "dead_page"
+        : consentOrBlock
+          ? "consent_or_block"
+          : error?.metadata?.outcome ?? "recoverable_failure",
+      terminal: deadPage || nextAttempt >= maxAttempts,
+      retryable: !deadPage && nextAttempt < maxAttempts,
+      scrape_attempt_count: nextAttempt,
+      max_attempts: maxAttempts,
+    },
+    severity: deadPage ? "info" : consentOrBlock ? "warning" : "error",
   });
+
+  return { terminal: deadPage || nextAttempt >= maxAttempts, deadPage };
 }
 
 async function processBatch(
@@ -454,6 +485,7 @@ async function processBatch(
   const productscrappedPayloads: Record<string, unknown>[] = [];
   let itemsUpserted = 0;
   let productscrappedWritten = 0;
+  let deadPages = 0;
 
   for (const item of scrapeResult.items) {
     const page = pagesByUrl.get(item.product_url);
@@ -590,13 +622,14 @@ async function processBatch(
   for (const page of pages) {
     if (!successfulUrls.has(page.page_url)) {
       failed++;
-      await markPageFailed(
+      const result = await markPageFailed(
         supabase,
         runId,
         page,
         errorsByUrl.get(page.page_url) ?? null,
         "Tesco worker did not return an item for this page",
       );
+      if (result.deadPage) deadPages++;
     }
   }
 
@@ -604,6 +637,7 @@ async function processBatch(
     claimed: pages.length,
     scraped,
     failed,
+    deadPages,
     itemsUpserted,
     productscrappedWritten,
     errorsReturned: scrapeResult.errors.length,
@@ -673,6 +707,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
   let pagesClaimed = 0;
   let pagesScraped = 0;
   let pagesFailed = 0;
+  let pagesDead = 0;
   let itemsUpserted = 0;
   let productscrappedWritten = 0;
   let adoptedPages = 0;
@@ -803,6 +838,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
       }
       pagesScraped += batch.scraped;
       pagesFailed += batch.failed;
+      pagesDead += batch.deadPages;
       itemsUpserted += batch.itemsUpserted;
       productscrappedWritten += batch.productscrappedWritten;
       addStats(stats, batch.stats);
@@ -811,12 +847,18 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
       const counts = await refreshRunCounts(supabase, runId, {
         items_written_to_productscrapped:
           existingProductScrappedWrites + productscrappedWritten,
-        last_message: `Railway worker batch ${loops}: ${batch.scraped} scraped, ${batch.failed} failed`,
-        last_error: batch.failed > 0 ? `${batch.failed} page(s) failed in latest worker batch` : null,
+        last_message: `Railway worker batch ${loops}: ${batch.scraped} scraped, ${batch.deadPages} dead, ${batch.failed} failed`,
+        last_error:
+          batch.failed > batch.deadPages
+            ? `${batch.failed - batch.deadPages} retryable page failure(s) in latest worker batch`
+            : null,
       });
       pendingRemaining = counts.pending;
       errorsCount = counts.errors;
-      lastError = batch.failed > 0 ? `${batch.failed} page(s) failed in latest worker batch` : null;
+      lastError =
+        batch.failed > batch.deadPages
+          ? `${batch.failed - batch.deadPages} retryable page failure(s) in latest worker batch`
+          : null;
 
       console.log("[tescoPageWorker] Batch complete", {
         run_id: runId,
@@ -825,6 +867,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
         pages_claimed: batch.claimed,
         pages_scraped: batch.scraped,
         pages_failed: batch.failed,
+        pages_dead: batch.deadPages,
         items_upserted: batch.itemsUpserted,
         productscrapped_written: batch.productscrappedWritten,
         stats: batch.stats,
@@ -879,6 +922,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     pages_claimed: pagesClaimed,
     pages_scraped: pagesScraped,
     pages_failed: pagesFailed,
+    pages_dead: pagesDead,
     items_upserted: itemsUpserted,
     productscrapped_written: productscrappedWritten,
     pending_remaining: pendingRemaining,

@@ -78,6 +78,8 @@ export interface TescoProductPageScrapeStats {
   jsonld_success: number;
   nextdata_success: number;
   meta_fallback_success: number;
+  dead_page: number;
+  consent_or_block: number;
   parse_failed: number;
   empty_html: number;
   brightdata_retryable_errors: number;
@@ -163,6 +165,8 @@ export async function scrapeTescoProductPages(
     jsonld_success: 0,
     nextdata_success: 0,
     meta_fallback_success: 0,
+    dead_page: 0,
+    consent_or_block: 0,
     parse_failed: 0,
     empty_html: 0,
     brightdata_retryable_errors: 0,
@@ -181,25 +185,35 @@ export async function scrapeTescoProductPages(
         }
 
         if (!response.ok) {
+          const classified = classifyTescoFailureHtml(response.html, response.status);
+          if (classified?.error_code === "TESCO_PRODUCT_PAGE_DEAD") stats.dead_page++;
+          if (classified?.error_code === "TESCO_PRODUCT_PAGE_CONSENT_OR_BLOCK") {
+            stats.consent_or_block++;
+          }
           errors.push({
             product_url: page.page_url,
             product_id: page.product_id ?? productIdFromTescoUrl(page.page_url),
             http_status: response.status,
-            error_code: "BRIGHTDATA_PRODUCT_PAGE_FETCH_ERROR",
-            error_message: response.error
-              ? `Bright Data product page fetch failed: ${response.error}`
-              : `Bright Data product page fetch failed with HTTP ${response.status}`,
-            metadata: buildParseDebugMetadata({
-              html: response.html,
-              productId: page.product_id ?? productIdFromTescoUrl(page.page_url),
-              contentType: response.contentType ?? null,
-              httpStatus: response.status,
-              render: response.render,
-              fetchAttempts: [response.render ? "render" : "raw"],
-              fetchElapsedMs: response.elapsedMs,
-              brightdataStatus: response.status,
-              debug: scrapeOptions.debug === true,
-            }),
+            error_code: classified?.error_code ?? "BRIGHTDATA_PRODUCT_PAGE_FETCH_ERROR",
+            error_message:
+              classified?.error_message ??
+              (response.error
+                ? `Bright Data product page fetch failed: ${response.error}`
+                : `Bright Data product page fetch failed with HTTP ${response.status}`),
+            metadata: {
+              ...buildParseDebugMetadata({
+                html: response.html,
+                productId: page.product_id ?? productIdFromTescoUrl(page.page_url),
+                contentType: response.contentType ?? null,
+                httpStatus: response.status,
+                render: response.render,
+                fetchAttempts: [response.render ? "render" : "raw"],
+                fetchElapsedMs: response.elapsedMs,
+                brightdataStatus: response.status,
+                debug: scrapeOptions.debug === true,
+              }),
+              ...(classified?.metadata ?? {}),
+            },
           });
           continue;
         }
@@ -235,26 +249,36 @@ export async function scrapeTescoProductPages(
           incrementParserStats(stats, item.extraction_method);
           items.push(item);
         } else {
-          stats.parse_failed++;
           const productId = page.product_id ?? productIdFromTescoUrl(page.page_url);
+          const classified = classifyTescoFailureHtml(response.html, response.status);
+          if (classified?.error_code === "TESCO_PRODUCT_PAGE_DEAD") stats.dead_page++;
+          else if (classified?.error_code === "TESCO_PRODUCT_PAGE_CONSENT_OR_BLOCK") {
+            stats.consent_or_block++;
+          } else {
+            stats.parse_failed++;
+          }
           errors.push({
             product_url: page.page_url,
             product_id: productId,
             http_status: response.status,
-            error_code: "TESCO_PRODUCT_PAGE_PARSE_ERROR",
+            error_code: classified?.error_code ?? "TESCO_PRODUCT_PAGE_PARSE_ERROR",
             error_message:
-              "Tesco product page was fetched but no product/price data could be extracted.",
-            metadata: buildParseDebugMetadata({
-              html: response.html,
-              productId,
-              contentType: response.contentType ?? null,
-              httpStatus: response.status,
-              render: response.render,
-              fetchAttempts: [response.render ? "render" : "raw"],
-              fetchElapsedMs: response.elapsedMs,
-              brightdataStatus: response.status,
-              debug: scrapeOptions.debug === true,
-            }),
+              classified?.error_message ??
+              "Tesco product page was fetched and looks live, but no product/price data could be extracted.",
+            metadata: {
+              ...buildParseDebugMetadata({
+                html: response.html,
+                productId,
+                contentType: response.contentType ?? null,
+                httpStatus: response.status,
+                render: response.render,
+                fetchAttempts: [response.render ? "render" : "raw"],
+                fetchElapsedMs: response.elapsedMs,
+                brightdataStatus: response.status,
+                debug: scrapeOptions.debug === true,
+              }),
+              ...(classified?.metadata ?? {}),
+            },
           });
         }
       } catch (error) {
@@ -337,6 +361,64 @@ function isUnusableProductPageHtml(html: string): boolean {
       html,
     )
   );
+}
+
+function classifyTescoFailureHtml(
+  html: string,
+  httpStatus: number,
+): {
+  error_code: string;
+  error_message: string;
+  metadata: Record<string, unknown>;
+} | null {
+  const text = normaliseWhitespace(
+    html
+      .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " "),
+  )?.toLowerCase();
+
+  const deadSignals = [
+    /not down this aisle/i,
+    /looks like that page is missing/i,
+    /try checking the url for errors/i,
+    /return to the home page/i,
+    /back to home/i,
+    /page not found/i,
+  ];
+  if (httpStatus === 404 || deadSignals.some((pattern) => pattern.test(html) || pattern.test(text ?? ""))) {
+    return {
+      error_code: "TESCO_PRODUCT_PAGE_DEAD",
+      error_message:
+        "Tesco returned a missing-page response for this product URL. The page is treated as dead and will not be retried.",
+      metadata: {
+        outcome: "dead_page",
+        terminal: true,
+        retryable: false,
+        detected_by: "tesco_missing_page_text",
+      },
+    };
+  }
+
+  if (
+    /cookie|consent|privacy preferences|onetrust|trustarc|accept all|access denied|request blocked|forbidden|captcha|unusual traffic|temporarily unavailable|verify you are human|security check/i.test(
+      html,
+    )
+  ) {
+    return {
+      error_code: "TESCO_PRODUCT_PAGE_CONSENT_OR_BLOCK",
+      error_message:
+        "Tesco product page fetch returned a consent, block, cookie, or bot-check page instead of product data.",
+      metadata: {
+        outcome: "consent_or_block",
+        terminal: false,
+        retryable: true,
+        detected_by: "consent_block_text",
+      },
+    };
+  }
+
+  return null;
 }
 
 function extractTescoProductPage(
