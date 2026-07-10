@@ -47,6 +47,11 @@ export interface TescoWorkerInput {
   max_active_workers?: unknown;
   worker_mode?: unknown;
   recheck_after_days?: unknown;
+  render_wait_ms?: unknown;
+  render_timeout_ms?: unknown;
+  raw_timeout_ms?: unknown;
+  empty_html_retry_count?: unknown;
+  empty_html_retry_delay_ms?: unknown;
   force?: unknown;
   debug?: unknown;
 }
@@ -598,7 +603,14 @@ async function processBatch(
   fetchMode: BrightDataFetchMode,
   debug: boolean,
   writeToProductscrapped: boolean,
-  requestTimeoutMs: number,
+  fetchSettings: {
+    requestTimeoutMs: number;
+    rawTimeoutMs: number;
+    renderTimeoutMs: number;
+    renderWaitMs: number;
+    emptyHtmlRetryCount: number;
+    emptyHtmlRetryDelayMs: number;
+  },
 ) {
   const startedAt = Date.now();
   const scrapeInputs: TescoProductPageInput[] = pages.map((page) => ({
@@ -613,7 +625,12 @@ async function processBatch(
     allow_render_fallback: allowRenderFallback,
     fetch_mode: fetchMode,
     debug,
-    requestTimeoutMs,
+    requestTimeoutMs: fetchSettings.requestTimeoutMs,
+    rawTimeoutMs: fetchSettings.rawTimeoutMs,
+    renderTimeoutMs: fetchSettings.renderTimeoutMs,
+    renderWaitMs: fetchSettings.renderWaitMs,
+    emptyHtmlRetryCount: fetchSettings.emptyHtmlRetryCount,
+    emptyHtmlRetryDelayMs: fetchSettings.emptyHtmlRetryDelayMs,
   });
   const pagesByUrl = new Map(pages.map((page) => [page.page_url, page]));
   const errorsByUrl = new Map(scrapeResult.errors.map((error) => [error.product_url, error]));
@@ -848,6 +865,11 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
   // max_concurrency controls how many Bright Data requests are in flight at once.
   const maxRuntimeSeconds = clampInt(input.max_runtime_seconds, 600, 30, 1800);
   const requestTimeoutMs = requestTimeoutFromRuntime(maxRuntimeSeconds);
+  const rawTimeoutMs = clampInt(input.raw_timeout_ms, 30_000, 5_000, 180_000);
+  const renderTimeoutMs = clampInt(input.render_timeout_ms, 90_000, 10_000, 180_000);
+  const renderWaitMs = clampInt(input.render_wait_ms, 10_000, 0, 60_000);
+  const emptyHtmlRetryCount = clampInt(input.empty_html_retry_count, 2, 0, 5);
+  const emptyHtmlRetryDelayMs = clampInt(input.empty_html_retry_delay_ms, 5_000, 250, 60_000);
   const allowRenderFallback = boolValue(input.allow_render_fallback, !fastFirstPass);
   const fetchMode = fetchModeValue(input.fetch_mode ?? (fastFirstPass ? "raw_only" : recoveryPass ? "render_first" : "raw_first"));
   const writeToProductscrapped = boolValue(input.write_to_productscrapped, false);
@@ -887,6 +909,11 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     max_concurrency: maxConcurrency,
     max_runtime_seconds: maxRuntimeSeconds,
     request_timeout_ms: requestTimeoutMs,
+    raw_timeout_ms: rawTimeoutMs,
+    render_timeout_ms: renderTimeoutMs,
+    render_wait_ms: renderWaitMs,
+    empty_html_retry_count: emptyHtmlRetryCount,
+    empty_html_retry_delay_ms: emptyHtmlRetryDelayMs,
     allow_render_fallback: allowRenderFallback,
     fetch_mode: fetchMode,
     write_to_productscrapped: writeToProductscrapped,
@@ -1008,7 +1035,14 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
           fetchMode,
           debug,
           writeToProductscrapped,
-          requestTimeoutMs,
+          {
+            requestTimeoutMs,
+            rawTimeoutMs,
+            renderTimeoutMs,
+            renderWaitMs,
+            emptyHtmlRetryCount,
+            emptyHtmlRetryDelayMs,
+          },
         );
       } catch (error) {
         await releaseClaimedPagesAfterBatchError(supabase, runId, pages, error);

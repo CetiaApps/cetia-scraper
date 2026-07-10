@@ -64,6 +64,16 @@ export interface TescoProductPageScrapeOptions {
   allowRenderFallback?: boolean;
   allow_render_fallback?: boolean;
   requestTimeoutMs?: number;
+  rawTimeoutMs?: number;
+  raw_timeout_ms?: number;
+  renderTimeoutMs?: number;
+  render_timeout_ms?: number;
+  renderWaitMs?: number;
+  render_wait_ms?: number;
+  emptyHtmlRetryCount?: number;
+  empty_html_retry_count?: number;
+  emptyHtmlRetryDelayMs?: number;
+  empty_html_retry_delay_ms?: number;
   fetchMode?: BrightDataFetchMode;
   fetch_mode?: BrightDataFetchMode;
   debug?: boolean;
@@ -163,6 +173,11 @@ export async function scrapeTescoProductPages(
   const scrapeOptions: TescoProductPageScrapeOptions = {
     allowRenderFallback: request.allowRenderFallback ?? request.allow_render_fallback ?? true,
     requestTimeoutMs: request.requestTimeoutMs,
+    rawTimeoutMs: request.rawTimeoutMs ?? request.raw_timeout_ms,
+    renderTimeoutMs: request.renderTimeoutMs ?? request.render_timeout_ms,
+    renderWaitMs: request.renderWaitMs ?? request.render_wait_ms,
+    emptyHtmlRetryCount: request.emptyHtmlRetryCount ?? request.empty_html_retry_count,
+    emptyHtmlRetryDelayMs: request.emptyHtmlRetryDelayMs ?? request.empty_html_retry_delay_ms,
     fetchMode: request.fetchMode ?? request.fetch_mode ?? getTescoProductFetchMode(),
     debug: request.debug === true,
   } as TescoProductPageScrapeOptions & { allow_render_fallback?: boolean };
@@ -221,12 +236,18 @@ export async function scrapeTescoProductPages(
                 httpStatus: response.status,
                 render: response.render,
                 fetchAttempts: [response.render ? "render" : "raw"],
-              fetchElapsedMs: response.elapsedMs,
-              brightdataStatus: response.status,
-              debug: scrapeOptions.debug === true,
-              fetchMode: scrapeOptions.fetchMode ?? scrapeOptions.fetch_mode,
-              retryableErrors: response.retryableErrors ?? 0,
-            }),
+                fetchElapsedMs: response.elapsedMs,
+                brightdataStatus: response.status,
+                debug: scrapeOptions.debug === true,
+                fetchMode: scrapeOptions.fetchMode ?? scrapeOptions.fetch_mode,
+                retryableErrors: response.retryableErrors ?? 0,
+                retryNumber: response.retryNumber ?? 0,
+                waitStrategy: response.waitStrategy,
+                rawFetchElapsedMs: response.rawFetchElapsedMs,
+                renderFetchElapsedMs: response.renderFetchElapsedMs,
+                renderWaitMs: response.renderWaitMs,
+                renderTimeoutMs: response.renderTimeoutMs,
+              }),
               ...(classified?.metadata ?? {}),
               ...(classified
                 ? {}
@@ -268,6 +289,12 @@ export async function scrapeTescoProductPages(
               debug: scrapeOptions.debug === true,
               fetchMode: scrapeOptions.fetchMode ?? scrapeOptions.fetch_mode,
               retryableErrors: response.retryableErrors ?? 0,
+              retryNumber: response.retryNumber ?? 0,
+              waitStrategy: response.waitStrategy,
+              rawFetchElapsedMs: response.rawFetchElapsedMs,
+              renderFetchElapsedMs: response.renderFetchElapsedMs,
+              renderWaitMs: response.renderWaitMs,
+              renderTimeoutMs: response.renderTimeoutMs,
               pageOutcome: "brightdata_empty_html",
               outcome: "recoverable_failure",
               retryable: true,
@@ -315,6 +342,12 @@ export async function scrapeTescoProductPages(
                 debug: scrapeOptions.debug === true,
                 fetchMode: scrapeOptions.fetchMode ?? scrapeOptions.fetch_mode,
                 retryableErrors: response.retryableErrors ?? 0,
+                retryNumber: response.retryNumber ?? 0,
+                waitStrategy: response.waitStrategy,
+                rawFetchElapsedMs: response.rawFetchElapsedMs,
+                renderFetchElapsedMs: response.renderFetchElapsedMs,
+                renderWaitMs: response.renderWaitMs,
+                renderTimeoutMs: response.renderTimeoutMs,
                 pageOutcome: classified?.page_outcome ?? "parse_error",
                 outcome:
                   typeof classified?.metadata?.outcome === "string"
@@ -356,7 +389,12 @@ async function fetchTescoProductPage(
   const firstRender = mode === "render_first" || mode === "render_only";
   const first = await fetchTescoHtmlViaBrightData(page.page_url, {
     render: firstRender,
-    timeoutMs: options.requestTimeoutMs,
+    timeoutMs: firstRender ? options.renderTimeoutMs ?? options.render_timeout_ms ?? options.requestTimeoutMs : options.rawTimeoutMs ?? options.raw_timeout_ms ?? options.requestTimeoutMs,
+    rawTimeoutMs: options.rawTimeoutMs ?? options.raw_timeout_ms,
+    renderTimeoutMs: options.renderTimeoutMs ?? options.render_timeout_ms,
+    renderWaitMs: options.renderWaitMs ?? options.render_wait_ms,
+    emptyHtmlRetryCount: options.emptyHtmlRetryCount ?? options.empty_html_retry_count,
+    emptyHtmlRetryDelayMs: options.emptyHtmlRetryDelayMs ?? options.empty_html_retry_delay_ms,
   });
 
   const fallbackRender =
@@ -380,12 +418,20 @@ async function fetchTescoProductPage(
 
   const second = await fetchTescoHtmlViaBrightData(page.page_url, {
     render: fallbackRender,
-    timeoutMs: options.requestTimeoutMs,
+    timeoutMs: fallbackRender ? options.renderTimeoutMs ?? options.render_timeout_ms ?? options.requestTimeoutMs : options.rawTimeoutMs ?? options.raw_timeout_ms ?? options.requestTimeoutMs,
+    rawTimeoutMs: options.rawTimeoutMs ?? options.raw_timeout_ms,
+    renderTimeoutMs: options.renderTimeoutMs ?? options.render_timeout_ms,
+    renderWaitMs: options.renderWaitMs ?? options.render_wait_ms,
+    emptyHtmlRetryCount: options.emptyHtmlRetryCount ?? options.empty_html_retry_count,
+    emptyHtmlRetryDelayMs: options.emptyHtmlRetryDelayMs ?? options.empty_html_retry_delay_ms,
   });
   second.retryableErrors =
     Number(first.retryableErrors ?? 0) + Number(second.retryableErrors ?? 0);
+  second.rawFetchElapsedMs = first.render ? second.rawFetchElapsedMs : first.elapsedMs;
+  second.renderFetchElapsedMs = second.render ? second.elapsedMs : first.elapsedMs;
   second.elapsedMs += first.elapsedMs;
   second.attempt += first.attempt;
+  second.retryNumber = Number(first.retryNumber ?? 0) + Number(second.retryNumber ?? 0);
   return second;
 }
 
@@ -543,6 +589,12 @@ function buildParseDebugMetadata(input: {
   fetchElapsedMs?: number;
   brightdataStatus?: number;
   retryableErrors?: number;
+  retryNumber?: number;
+  waitStrategy?: string;
+  rawFetchElapsedMs?: number | null;
+  renderFetchElapsedMs?: number | null;
+  renderWaitMs?: number;
+  renderTimeoutMs?: number;
   debug?: boolean;
   fetchMode?: BrightDataFetchMode;
   pageOutcome?: string;
@@ -567,6 +619,12 @@ function buildParseDebugMetadata(input: {
     fetch_elapsed_ms: input.fetchElapsedMs ?? null,
     brightdata_status: input.brightdataStatus ?? input.httpStatus,
     brightdata_retryable_errors: input.retryableErrors ?? 0,
+    retry_number: input.retryNumber ?? 0,
+    wait_strategy: input.waitStrategy ?? null,
+    raw_fetch_elapsed_ms: input.rawFetchElapsedMs ?? null,
+    render_fetch_elapsed_ms: input.renderFetchElapsedMs ?? null,
+    render_wait_ms: input.renderWaitMs ?? null,
+    render_timeout_ms: input.renderTimeoutMs ?? null,
     title_tag: titleTag(html),
     has_price_symbol: /\u00a3|&pound;|\bpound\b|\bprice\b/i.test(html),
     has_product_id: productIdPattern ? productIdPattern.test(html) : false,

@@ -83,6 +83,11 @@ tescoSitemapRouter.post(
         allow_render_fallback: allowRenderFallback,
         fetch_mode: body.fetch_mode,
         debug: body.debug === true,
+        raw_timeout_ms: body.raw_timeout_ms,
+        render_timeout_ms: body.render_timeout_ms,
+        render_wait_ms: body.render_wait_ms,
+        empty_html_retry_count: body.empty_html_retry_count,
+        empty_html_retry_delay_ms: body.empty_html_retry_delay_ms,
       });
 
       res.json({
