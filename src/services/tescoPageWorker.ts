@@ -12,6 +12,12 @@ import { getTescoProductFetchMode, type BrightDataFetchMode } from "./brightdata
 const SUPERMARKET_CODE = "tesco";
 const SUPERMARKET_NAME = "Tesco";
 const STALE_CLAIM_MINUTES = 10;
+const EMPTY_HTML_CIRCUIT_BREAKER_CODE = "BRIGHTDATA_EMPTY_HTML_CIRCUIT_BREAKER";
+const EMPTY_HTML_CIRCUIT_BREAKER_MESSAGE =
+  "Bright Data is returning empty HTML for most Tesco pages. Scraper paused to avoid wasting requests.";
+const EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS = 100;
+const EMPTY_HTML_CIRCUIT_BREAKER_MAX_SUCCESS_RATE = 0.05;
+const EMPTY_HTML_CIRCUIT_BREAKER_MIN_EMPTY_HTML_RATE = 0.8;
 
 type SupabaseClient = ReturnType<typeof createSupabaseServiceClient>;
 
@@ -62,7 +68,12 @@ export interface TescoWorkerResult {
   errors_count: number;
   adopted_pages: number;
   stats: TescoProductPageScrapeStats;
-  stopped_reason: "max_runtime_reached" | "no_pages_remaining" | "cancelled" | "error";
+  stopped_reason:
+    | "max_runtime_reached"
+    | "no_pages_remaining"
+    | "cancelled"
+    | "error"
+    | "circuit_breaker";
   message: string;
 }
 
@@ -118,6 +129,47 @@ function addStats(
   for (const key of Object.keys(target) as Array<keyof TescoProductPageScrapeStats>) {
     target[key] += Number(source[key] ?? 0);
   }
+}
+
+interface CircuitBreakerSample {
+  attempted: number;
+  scraped: number;
+  brightdataEmptyHtml: number;
+}
+
+interface CircuitBreakerWindow extends CircuitBreakerSample {
+  successRate: number;
+  brightdataEmptyHtmlRate: number;
+}
+
+function latestCircuitBreakerWindow(samples: CircuitBreakerSample[]): CircuitBreakerWindow {
+  let attempted = 0;
+  let scraped = 0;
+  let brightdataEmptyHtml = 0;
+
+  for (let index = samples.length - 1; index >= 0; index--) {
+    const sample = samples[index];
+    attempted += sample.attempted;
+    scraped += sample.scraped;
+    brightdataEmptyHtml += sample.brightdataEmptyHtml;
+    if (attempted >= EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS) break;
+  }
+
+  return {
+    attempted,
+    scraped,
+    brightdataEmptyHtml,
+    successRate: attempted > 0 ? scraped / attempted : 0,
+    brightdataEmptyHtmlRate: attempted > 0 ? brightdataEmptyHtml / attempted : 0,
+  };
+}
+
+function shouldTripEmptyHtmlCircuitBreaker(window: CircuitBreakerWindow): boolean {
+  return (
+    window.attempted >= EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS &&
+    window.successRate < EMPTY_HTML_CIRCUIT_BREAKER_MAX_SUCCESS_RATE &&
+    window.brightdataEmptyHtmlRate > EMPTY_HTML_CIRCUIT_BREAKER_MIN_EMPTY_HTML_RATE
+  );
 }
 
 function requestTimeoutFromRuntime(maxRuntimeSeconds: number): number {
@@ -826,6 +878,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
   let pendingRemaining = 0;
   let errorsCount = 0;
   const stats = emptyStats();
+  const circuitBreakerSamples: CircuitBreakerSample[] = [];
 
   console.log("[tescoPageWorker] Worker start", {
     run_id: runId,
@@ -967,6 +1020,11 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
       itemsUpserted += batch.itemsUpserted;
       productscrappedWritten += batch.productscrappedWritten;
       addStats(stats, batch.stats);
+      circuitBreakerSamples.push({
+        attempted: batch.claimed,
+        scraped: batch.scraped,
+        brightdataEmptyHtml: Number(batch.stats?.empty_html ?? 0),
+      });
 
       const existingProductScrappedWrites = Number(run.items_written_to_productscrapped ?? 0);
       const counts = await refreshRunCounts(supabase, runId, {
@@ -998,6 +1056,47 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
         stats: batch.stats,
         elapsed_ms: batch.elapsedMs,
       });
+
+      const circuitBreakerWindow = latestCircuitBreakerWindow(circuitBreakerSamples);
+      if (shouldTripEmptyHtmlCircuitBreaker(circuitBreakerWindow)) {
+        stoppedReason = "circuit_breaker";
+        lastError = EMPTY_HTML_CIRCUIT_BREAKER_CODE;
+
+        const metadata = {
+          attempted_pages: circuitBreakerWindow.attempted,
+          scraped_pages: circuitBreakerWindow.scraped,
+          brightdata_empty_html_pages: circuitBreakerWindow.brightdataEmptyHtml,
+          success_rate: circuitBreakerWindow.successRate,
+          brightdata_empty_html_rate: circuitBreakerWindow.brightdataEmptyHtmlRate,
+          min_attempted_pages: EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS,
+          max_success_rate: EMPTY_HTML_CIRCUIT_BREAKER_MAX_SUCCESS_RATE,
+          min_brightdata_empty_html_rate: EMPTY_HTML_CIRCUIT_BREAKER_MIN_EMPTY_HTML_RATE,
+        };
+
+        console.warn("[tescoPageWorker] Empty HTML circuit breaker tripped", {
+          run_id: runId,
+          worker_id: workerId,
+          ...metadata,
+        });
+
+        await logScrapeError(supabase, {
+          runId,
+          phase: "railway_worker",
+          code: EMPTY_HTML_CIRCUIT_BREAKER_CODE,
+          message: EMPTY_HTML_CIRCUIT_BREAKER_MESSAGE,
+          metadata,
+          severity: "error",
+        });
+
+        await refreshRunCounts(supabase, runId, {
+          status: "paused",
+          phase: "circuit_breaker",
+          finished_at: new Date().toISOString(),
+          last_message: EMPTY_HTML_CIRCUIT_BREAKER_MESSAGE,
+          last_error: EMPTY_HTML_CIRCUIT_BREAKER_CODE,
+        });
+        break;
+      }
     }
   } catch (error) {
     stoppedReason = "error";
@@ -1012,15 +1111,24 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
 
   const finalCounts = await refreshRunCounts(supabase, runId, {
     last_message:
-      stoppedReason === "no_pages_remaining"
+      stoppedReason === "circuit_breaker"
+        ? EMPTY_HTML_CIRCUIT_BREAKER_MESSAGE
+        : stoppedReason === "no_pages_remaining"
         ? "Railway worker completed: no Tesco product pages remain"
         : `Railway worker stopped: ${stoppedReason}`,
     last_error: lastError,
+    ...(stoppedReason === "circuit_breaker"
+      ? {
+          status: "paused",
+          phase: "circuit_breaker",
+          finished_at: new Date().toISOString(),
+        }
+      : {}),
   });
   pendingRemaining = finalCounts.pending;
   errorsCount = finalCounts.errors;
 
-  if (pendingRemaining === 0 && finalCounts.scraping === 0) {
+  if (stoppedReason !== "circuit_breaker" && pendingRemaining === 0 && finalCounts.scraping === 0) {
     await supabase
       .from("supermarket_price_scrape_runs")
       .update({
@@ -1055,7 +1163,10 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     adopted_pages: adoptedPages,
     stats,
     stopped_reason: stoppedReason,
-    message: `Railway worker stopped: ${stoppedReason}`,
+    message:
+      stoppedReason === "circuit_breaker"
+        ? EMPTY_HTML_CIRCUIT_BREAKER_MESSAGE
+        : `Railway worker stopped: ${stoppedReason}`,
   };
 
   console.log("[tescoPageWorker] Worker finish", result);
