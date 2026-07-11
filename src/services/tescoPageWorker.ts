@@ -19,6 +19,8 @@ const FAST_PASS_EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS = 100;
 const RECOVERY_EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS = 50;
 const EMPTY_HTML_CIRCUIT_BREAKER_MAX_SUCCESS_RATE = 0.05;
 const EMPTY_HTML_CIRCUIT_BREAKER_MIN_EMPTY_HTML_RATE = 0.8;
+const FAST_PASS_ADAPTIVE_THROTTLE_EMPTY_HTML_RATE = 0.5;
+const FAST_PASS_ADAPTIVE_PAUSE_EMPTY_HTML_RATE = 0.7;
 
 type SupabaseClient = ReturnType<typeof createSupabaseServiceClient>;
 
@@ -73,6 +75,15 @@ export interface TescoWorkerResult {
   pending_remaining: number;
   errors_count: number;
   adopted_pages: number;
+  adaptive_throttle_events: number;
+  effective_max_concurrency: number;
+  adaptive_window?: {
+    attempted: number;
+    scraped: number;
+    brightdata_empty_html: number;
+    brightdata_empty_html_rate: number;
+    success_rate: number;
+  };
   stats: TescoProductPageScrapeStats;
   stopped_reason:
     | "max_runtime_reached"
@@ -878,7 +889,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     : clampInt(input.render_timeout_ms, recoveryPass ? 90_000 : 90_000, 10_000, 180_000);
   const renderWaitMs = fastFirstPass
     ? 0
-    : clampInt(input.render_wait_ms, recoveryPass ? 10_000 : 10_000, 0, 60_000);
+    : clampInt(input.render_wait_ms, recoveryPass ? 8_000 : 10_000, 0, 60_000);
   const emptyHtmlRetryCount = fastFirstPass
     ? 0
     : clampInt(input.empty_html_retry_count, recoveryPass ? 1 : 2, 0, 5);
@@ -918,8 +929,25 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
   let lastError: string | null = null;
   let pendingRemaining = 0;
   let errorsCount = 0;
+  let effectiveMaxConcurrency = maxConcurrency;
+  let adaptiveThrottleEvents = 0;
+  let latestAdaptiveWindow: CircuitBreakerWindow | null = null;
   const stats = emptyStats();
   const circuitBreakerSamples: CircuitBreakerSample[] = [];
+  const workerConfig = {
+    worker_mode: workerMode,
+    fetch_mode: fetchMode,
+    render_wait_ms: renderWaitMs,
+    empty_html_retry_count: emptyHtmlRetryCount,
+    max_concurrency: maxConcurrency,
+    effective_max_concurrency: effectiveMaxConcurrency,
+    max_active_workers: maxActiveWorkers,
+    allow_render_fallback: allowRenderFallback,
+    batch_size: batchSize,
+    include_failed: includeFailed,
+    only_recoverable_failed: onlyRecoverableFailed,
+    exclude_dead_pages: excludeDeadPages,
+  };
 
   console.log("[tescoPageWorker] Worker start", {
     run_id: runId,
@@ -942,11 +970,12 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     exclude_dead_pages: excludeDeadPages,
     max_active_workers: maxActiveWorkers,
     worker_mode: workerMode,
+    worker_config: workerConfig,
   });
 
   const { data: run, error: runError } = await supabase
     .from("supermarket_price_scrape_runs")
-    .select("id,status,items_written_to_productscrapped")
+    .select("id,status,items_written_to_productscrapped,config")
     .eq("id", runId)
     .single();
   if (runError || !run) throw new Error(runError?.message ?? "Run not found");
@@ -972,10 +1001,14 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
       status: "scraping",
       phase: "railway_worker",
       last_heartbeat_at: new Date().toISOString(),
+      config: {
+        ...(typeof run.config === "object" && run.config !== null ? run.config : {}),
+        railway_worker_config: workerConfig,
+      },
       last_message:
         recoveredActivePages > 0
           ? `Railway worker recovered ${recoveredActivePages} active page claim(s) and started`
-          : "Railway Tesco product page worker started",
+          : `Railway Tesco product page worker started (${workerMode}, ${fetchMode}, concurrency ${effectiveMaxConcurrency})`,
       updated_at: new Date().toISOString(),
     })
     .eq("id", runId);
@@ -1049,7 +1082,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
           supabase,
           runId,
           pages,
-          maxConcurrency,
+          effectiveMaxConcurrency,
           allowRenderFallback,
           fetchMode,
           debug,
@@ -1106,6 +1139,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
         pages_dead: batch.deadPages,
         items_upserted: batch.itemsUpserted,
         productscrapped_written: batch.productscrappedWritten,
+        effective_max_concurrency: effectiveMaxConcurrency,
         stats: batch.stats,
         elapsed_ms: batch.elapsedMs,
       });
@@ -1113,11 +1147,55 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
       const circuitBreakerMinAttempts = recoveryPass
         ? RECOVERY_EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS
         : FAST_PASS_EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS;
+      const adaptiveWindow = latestCircuitBreakerWindow(
+        circuitBreakerSamples,
+        FAST_PASS_EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS,
+      );
+      latestAdaptiveWindow = adaptiveWindow;
+      if (
+        fastFirstPass &&
+        adaptiveWindow.attempted >= FAST_PASS_EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS &&
+        adaptiveWindow.brightdataEmptyHtmlRate > FAST_PASS_ADAPTIVE_THROTTLE_EMPTY_HTML_RATE &&
+        effectiveMaxConcurrency > 1
+      ) {
+        effectiveMaxConcurrency -= 1;
+        adaptiveThrottleEvents += 1;
+        workerConfig.effective_max_concurrency = effectiveMaxConcurrency;
+        console.warn("[tescoPageWorker] Adaptive throttling lowered concurrency", {
+          run_id: runId,
+          worker_id: workerId,
+          worker_mode: workerMode,
+          effective_max_concurrency: effectiveMaxConcurrency,
+          attempted_pages: adaptiveWindow.attempted,
+          brightdata_empty_html_rate: adaptiveWindow.brightdataEmptyHtmlRate,
+        });
+        await refreshRunCounts(supabase, runId, {
+          config: {
+            ...(typeof run.config === "object" && run.config !== null ? run.config : {}),
+            railway_worker_config: workerConfig,
+            adaptive_throttle: {
+              empty_html_rate: adaptiveWindow.brightdataEmptyHtmlRate,
+              attempted_pages: adaptiveWindow.attempted,
+              effective_max_concurrency: effectiveMaxConcurrency,
+              throttle_events: adaptiveThrottleEvents,
+              updated_at: new Date().toISOString(),
+            },
+          },
+          last_message: `Adaptive throttle: empty HTML ${Math.round(adaptiveWindow.brightdataEmptyHtmlRate * 100)}%, concurrency lowered to ${effectiveMaxConcurrency}`,
+        });
+      }
       const circuitBreakerWindow = latestCircuitBreakerWindow(
         circuitBreakerSamples,
         circuitBreakerMinAttempts,
       );
-      if (shouldTripEmptyHtmlCircuitBreaker(circuitBreakerWindow, circuitBreakerMinAttempts)) {
+      const fastPassAdaptivePause =
+        fastFirstPass &&
+        adaptiveWindow.attempted >= FAST_PASS_EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS &&
+        adaptiveWindow.brightdataEmptyHtmlRate > FAST_PASS_ADAPTIVE_PAUSE_EMPTY_HTML_RATE;
+      if (
+        shouldTripEmptyHtmlCircuitBreaker(circuitBreakerWindow, circuitBreakerMinAttempts) ||
+        fastPassAdaptivePause
+      ) {
         stoppedReason = "circuit_breaker";
         lastError = EMPTY_HTML_CIRCUIT_BREAKER_CODE;
 
@@ -1130,7 +1208,11 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
           worker_mode: workerMode,
           min_attempted_pages: circuitBreakerMinAttempts,
           max_success_rate: EMPTY_HTML_CIRCUIT_BREAKER_MAX_SUCCESS_RATE,
-          min_brightdata_empty_html_rate: EMPTY_HTML_CIRCUIT_BREAKER_MIN_EMPTY_HTML_RATE,
+          min_brightdata_empty_html_rate: fastPassAdaptivePause
+            ? FAST_PASS_ADAPTIVE_PAUSE_EMPTY_HTML_RATE
+            : EMPTY_HTML_CIRCUIT_BREAKER_MIN_EMPTY_HTML_RATE,
+          adaptive_pause: fastPassAdaptivePause,
+          effective_max_concurrency: effectiveMaxConcurrency,
         };
 
         console.warn("[tescoPageWorker] Empty HTML circuit breaker tripped", {
@@ -1152,6 +1234,18 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
           status: "paused",
           phase: "circuit_breaker",
           finished_at: new Date().toISOString(),
+          config: {
+            ...(typeof run.config === "object" && run.config !== null ? run.config : {}),
+            railway_worker_config: workerConfig,
+            adaptive_throttle: {
+              empty_html_rate: adaptiveWindow.brightdataEmptyHtmlRate,
+              attempted_pages: adaptiveWindow.attempted,
+              effective_max_concurrency: effectiveMaxConcurrency,
+              throttle_events: adaptiveThrottleEvents,
+              paused: true,
+              updated_at: new Date().toISOString(),
+            },
+          },
           last_message: EMPTY_HTML_CIRCUIT_BREAKER_MESSAGE,
           last_error: EMPTY_HTML_CIRCUIT_BREAKER_CODE,
         });
@@ -1221,6 +1315,17 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     pending_remaining: pendingRemaining,
     errors_count: errorsCount,
     adopted_pages: adoptedPages,
+    adaptive_throttle_events: adaptiveThrottleEvents,
+    effective_max_concurrency: effectiveMaxConcurrency,
+    adaptive_window: latestAdaptiveWindow
+      ? {
+          attempted: latestAdaptiveWindow.attempted,
+          scraped: latestAdaptiveWindow.scraped,
+          brightdata_empty_html: latestAdaptiveWindow.brightdataEmptyHtml,
+          brightdata_empty_html_rate: latestAdaptiveWindow.brightdataEmptyHtmlRate,
+          success_rate: latestAdaptiveWindow.successRate,
+        }
+      : undefined,
     stats,
     stopped_reason: stoppedReason,
     message:
