@@ -15,7 +15,8 @@ const STALE_CLAIM_MINUTES = 10;
 const EMPTY_HTML_CIRCUIT_BREAKER_CODE = "BRIGHTDATA_EMPTY_HTML_CIRCUIT_BREAKER";
 const EMPTY_HTML_CIRCUIT_BREAKER_MESSAGE =
   "Bright Data is returning empty HTML for most Tesco pages. Scraper paused to avoid wasting requests.";
-const EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS = 100;
+const FAST_PASS_EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS = 100;
+const RECOVERY_EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS = 50;
 const EMPTY_HTML_CIRCUIT_BREAKER_MAX_SUCCESS_RATE = 0.05;
 const EMPTY_HTML_CIRCUIT_BREAKER_MIN_EMPTY_HTML_RATE = 0.8;
 
@@ -147,7 +148,10 @@ interface CircuitBreakerWindow extends CircuitBreakerSample {
   brightdataEmptyHtmlRate: number;
 }
 
-function latestCircuitBreakerWindow(samples: CircuitBreakerSample[]): CircuitBreakerWindow {
+function latestCircuitBreakerWindow(
+  samples: CircuitBreakerSample[],
+  minAttempts: number,
+): CircuitBreakerWindow {
   let attempted = 0;
   let scraped = 0;
   let brightdataEmptyHtml = 0;
@@ -157,7 +161,7 @@ function latestCircuitBreakerWindow(samples: CircuitBreakerSample[]): CircuitBre
     attempted += sample.attempted;
     scraped += sample.scraped;
     brightdataEmptyHtml += sample.brightdataEmptyHtml;
-    if (attempted >= EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS) break;
+    if (attempted >= minAttempts) break;
   }
 
   return {
@@ -169,9 +173,12 @@ function latestCircuitBreakerWindow(samples: CircuitBreakerSample[]): CircuitBre
   };
 }
 
-function shouldTripEmptyHtmlCircuitBreaker(window: CircuitBreakerWindow): boolean {
+function shouldTripEmptyHtmlCircuitBreaker(
+  window: CircuitBreakerWindow,
+  minAttempts: number,
+): boolean {
   return (
-    window.attempted >= EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS &&
+    window.attempted >= minAttempts &&
     window.successRate < EMPTY_HTML_CIRCUIT_BREAKER_MAX_SUCCESS_RATE &&
     window.brightdataEmptyHtmlRate > EMPTY_HTML_CIRCUIT_BREAKER_MIN_EMPTY_HTML_RATE
   );
@@ -866,12 +873,24 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
   const maxRuntimeSeconds = clampInt(input.max_runtime_seconds, 600, 30, 1800);
   const requestTimeoutMs = requestTimeoutFromRuntime(maxRuntimeSeconds);
   const rawTimeoutMs = clampInt(input.raw_timeout_ms, 30_000, 5_000, 180_000);
-  const renderTimeoutMs = clampInt(input.render_timeout_ms, 90_000, 10_000, 180_000);
-  const renderWaitMs = clampInt(input.render_wait_ms, 10_000, 0, 60_000);
-  const emptyHtmlRetryCount = clampInt(input.empty_html_retry_count, 2, 0, 5);
-  const emptyHtmlRetryDelayMs = clampInt(input.empty_html_retry_delay_ms, 5_000, 250, 60_000);
-  const allowRenderFallback = boolValue(input.allow_render_fallback, !fastFirstPass);
-  const fetchMode = fetchModeValue(input.fetch_mode ?? (fastFirstPass ? "raw_only" : recoveryPass ? "render_first" : "raw_first"));
+  const renderTimeoutMs = fastFirstPass
+    ? 30_000
+    : clampInt(input.render_timeout_ms, recoveryPass ? 90_000 : 90_000, 10_000, 180_000);
+  const renderWaitMs = fastFirstPass
+    ? 0
+    : clampInt(input.render_wait_ms, recoveryPass ? 10_000 : 10_000, 0, 60_000);
+  const emptyHtmlRetryCount = fastFirstPass
+    ? 0
+    : clampInt(input.empty_html_retry_count, recoveryPass ? 1 : 2, 0, 5);
+  const emptyHtmlRetryDelayMs = fastFirstPass
+    ? 500
+    : clampInt(input.empty_html_retry_delay_ms, recoveryPass ? 5_000 : 5_000, 250, 60_000);
+  const allowRenderFallback = fastFirstPass
+    ? false
+    : boolValue(input.allow_render_fallback, recoveryPass);
+  const fetchMode = fastFirstPass
+    ? "raw_only"
+    : fetchModeValue(input.fetch_mode ?? (recoveryPass ? "raw_first" : "raw_first"));
   const writeToProductscrapped = boolValue(input.write_to_productscrapped, false);
   const stopWhenNoPages = boolValue(input.stop_when_no_pages, true);
   const adoptGlobalPendingPages = boolValue(input.adopt_global_pending_pages, true);
@@ -1091,8 +1110,14 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
         elapsed_ms: batch.elapsedMs,
       });
 
-      const circuitBreakerWindow = latestCircuitBreakerWindow(circuitBreakerSamples);
-      if (shouldTripEmptyHtmlCircuitBreaker(circuitBreakerWindow)) {
+      const circuitBreakerMinAttempts = recoveryPass
+        ? RECOVERY_EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS
+        : FAST_PASS_EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS;
+      const circuitBreakerWindow = latestCircuitBreakerWindow(
+        circuitBreakerSamples,
+        circuitBreakerMinAttempts,
+      );
+      if (shouldTripEmptyHtmlCircuitBreaker(circuitBreakerWindow, circuitBreakerMinAttempts)) {
         stoppedReason = "circuit_breaker";
         lastError = EMPTY_HTML_CIRCUIT_BREAKER_CODE;
 
@@ -1102,7 +1127,8 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
           brightdata_empty_html_pages: circuitBreakerWindow.brightdataEmptyHtml,
           success_rate: circuitBreakerWindow.successRate,
           brightdata_empty_html_rate: circuitBreakerWindow.brightdataEmptyHtmlRate,
-          min_attempted_pages: EMPTY_HTML_CIRCUIT_BREAKER_MIN_ATTEMPTS,
+          worker_mode: workerMode,
+          min_attempted_pages: circuitBreakerMinAttempts,
           max_success_rate: EMPTY_HTML_CIRCUIT_BREAKER_MAX_SUCCESS_RATE,
           min_brightdata_empty_html_rate: EMPTY_HTML_CIRCUIT_BREAKER_MIN_EMPTY_HTML_RATE,
         };

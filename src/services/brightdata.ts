@@ -117,7 +117,7 @@ export async function fetchTescoHtmlViaBrightData(
     180_000,
   );
   const renderWaitMs = Math.min(
-    Math.max(Number(options.renderWaitMs) || 10_000, 0),
+    Math.max(Number(options.renderWaitMs ?? 10_000), 0),
     60_000,
   );
   const timeoutMs = Math.min(
