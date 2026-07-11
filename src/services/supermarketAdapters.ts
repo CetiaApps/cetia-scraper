@@ -221,6 +221,34 @@ function isLikelySitemap(url: string) {
   return /sitemap|\.xml(?:$|\?)/i.test(url);
 }
 
+async function fetchSourceViaBrightData(url: string, adapter: Adapter) {
+  try {
+    const bright = await fetchViaBrightData(url, {
+      render: false,
+      rawTimeoutMs: 45_000,
+      timeoutMs: 45_000,
+      maxRetries: 1,
+      emptyHtmlRetryCount: 0,
+    });
+    if (bright.ok && bright.html.trim()) {
+      return {
+        ok: true,
+        status: bright.status,
+        text: bright.html,
+        fetchMethod: "brightdata_raw",
+        contentType: bright.contentType ?? null,
+      };
+    }
+  } catch (error) {
+    console.warn("[supermarketIndexer] Bright Data sitemap fallback failed", {
+      supermarket_code: adapter.code,
+      url,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return null;
+}
+
 async function fetchSourceText(url: string, adapter: Adapter) {
   const response = await fetch(url, {
     headers: {
@@ -231,6 +259,10 @@ async function fetchSourceText(url: string, adapter: Adapter) {
   });
   const text = await response.text();
   if (response.ok) {
+    if (isLikelySitemap(url) && !/<loc\b/i.test(text)) {
+      const bright = await fetchSourceViaBrightData(url, adapter);
+      if (bright && /<loc\b/i.test(bright.text)) return bright;
+    }
     return {
       ok: true,
       status: response.status,
@@ -241,30 +273,8 @@ async function fetchSourceText(url: string, adapter: Adapter) {
   }
 
   if ([401, 403, 429].includes(response.status)) {
-    try {
-      const bright = await fetchViaBrightData(url, {
-        render: false,
-        rawTimeoutMs: 45_000,
-        timeoutMs: 45_000,
-        maxRetries: 1,
-        emptyHtmlRetryCount: 0,
-      });
-      if (bright.ok && bright.html.trim()) {
-        return {
-          ok: true,
-          status: bright.status,
-          text: bright.html,
-          fetchMethod: "brightdata_raw",
-          contentType: bright.contentType ?? null,
-        };
-      }
-    } catch (error) {
-      console.warn("[supermarketIndexer] Bright Data sitemap fallback failed", {
-        supermarket_code: adapter.code,
-        url,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
+    const bright = await fetchSourceViaBrightData(url, adapter);
+    if (bright) return bright;
   }
 
   return {
@@ -518,7 +528,20 @@ export async function indexSupermarketPages(
         continue;
       }
 
-      for (const loc of locsFromXml(text)) {
+      const locs = locsFromXml(text);
+      if (locs.length === 0) {
+        const item = {
+          url: sitemapUrl,
+          http_status: source.status,
+          error_code: "SUPERMARKET_SITEMAP_NO_LOCS",
+          error_message: `${adapter.name} sitemap returned no <loc> entries via ${source.fetchMethod}`,
+        };
+        errors.push(item);
+        await logIndexError(supabase, adapter, runId, item);
+        continue;
+      }
+
+      for (const loc of locs) {
         if (adapter.productUrlPattern.test(loc)) {
           sourceUrlsDiscovered += 1;
           const cleanUrl = normalizeProductUrl(loc, sitemapUrl);
