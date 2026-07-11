@@ -114,7 +114,10 @@ export const supermarketAdapters: Record<SupermarketCode, Adapter> = {
     name: "Ocado/M&S",
     supportsIndexing: true,
     supportsPriceScraping: false,
-    defaultSitemapUrls: ["https://www.ocado.com/sitemaps/sitemap_index.xml"],
+    defaultSitemapUrls: [
+      "https://www.ocado.com/sitemaps/sitemap_index.xml",
+      "https://www.ocado.com/sitemaps/sitemap-products-part1.xml",
+    ],
     productUrlPattern: /ocado\.com\/products\/.+\/\d+(?:$|[/?#])/i,
     extractProductId(url) {
       return /\/products\/[^/]+\/(\d+)/i.exec(url)?.[1] ?? null;
@@ -473,7 +476,12 @@ export async function indexSupermarketPages(
   const requestedUrls = Array.isArray(input.sitemap_urls)
     ? input.sitemap_urls.filter((url): url is string => typeof url === "string" && url.trim().length > 0)
     : null;
-  const queue = [...(requestedUrls ?? envSitemapUrls(code) ?? adapter.defaultSitemapUrls)];
+  const sourceSitemapUrls =
+    requestedUrls ??
+    [...(envSitemapUrls(code) ?? []), ...adapter.defaultSitemapUrls].filter(
+      (url, index, urls) => urls.indexOf(url) === index,
+    );
+  const queue = [...sourceSitemapUrls];
   const seenSitemaps = new Set<string>();
   const seenPages = new Set<string>();
   const pages: Array<{
