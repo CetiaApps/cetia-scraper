@@ -1,4 +1,5 @@
 import { createSupabaseServiceClient } from "./supabase.js";
+import { fetchViaBrightData } from "./brightdata.js";
 
 type SupabaseClient = ReturnType<typeof createSupabaseServiceClient>;
 
@@ -58,6 +59,7 @@ interface Adapter {
   supportsPriceScraping: boolean;
   defaultSitemapUrls: string[];
   productUrlPattern: RegExp;
+  pageType?: "product" | "category";
   extractProductId(url: string): string | null;
 }
 
@@ -84,11 +86,63 @@ export const supermarketAdapters: Record<SupermarketCode, Adapter> = {
       return /-(\d+)(?:$|[/?#])/i.exec(url)?.[1] ?? null;
     },
   },
-  asda: unsupported("asda", "ASDA"),
-  morrisons: unsupported("morrisons", "Morrisons"),
-  ocado: unsupported("ocado", "Ocado/M&S"),
-  sainsburys: unsupported("sainsburys", "Sainsbury's"),
-  waitrose: unsupported("waitrose", "Waitrose"),
+  asda: {
+    code: "asda",
+    name: "ASDA",
+    supportsIndexing: true,
+    supportsPriceScraping: false,
+    defaultSitemapUrls: ["https://www.asda.com/sitemap-index.xml"],
+    productUrlPattern: /asda\.com\/groceries\/product\/[^?#]+/i,
+    extractProductId(url) {
+      const path = new URL(url).pathname.split("/").filter(Boolean);
+      return path.at(-1) ?? null;
+    },
+  },
+  morrisons: {
+    code: "morrisons",
+    name: "Morrisons",
+    supportsIndexing: true,
+    supportsPriceScraping: false,
+    defaultSitemapUrls: ["https://groceries.morrisons.com/sitemaps/sitemap_index.xml"],
+    productUrlPattern: /groceries\.morrisons\.com\/products\/[^/?#]+\/\d+(?:$|[/?#])/i,
+    extractProductId(url) {
+      return /\/products\/[^/]+\/(\d+)/i.exec(url)?.[1] ?? null;
+    },
+  },
+  ocado: {
+    code: "ocado",
+    name: "Ocado/M&S",
+    supportsIndexing: true,
+    supportsPriceScraping: false,
+    defaultSitemapUrls: ["https://www.ocado.com/sitemaps/sitemap_index.xml"],
+    productUrlPattern: /ocado\.com\/products\/[^/?#]+\/\d+(?:$|[/?#])/i,
+    extractProductId(url) {
+      return /\/products\/[^/]+\/(\d+)/i.exec(url)?.[1] ?? null;
+    },
+  },
+  sainsburys: {
+    code: "sainsburys",
+    name: "Sainsbury's",
+    supportsIndexing: true,
+    supportsPriceScraping: false,
+    defaultSitemapUrls: ["https://www.sainsburys.co.uk/sitemap.xml"],
+    productUrlPattern: /sainsburys\.co\.uk\/gol-ui\/groceries\/[^?#]+\/c:\d+/i,
+    pageType: "category",
+    extractProductId(url) {
+      return /\/c:(\d+)/i.exec(url)?.[1] ?? null;
+    },
+  },
+  waitrose: {
+    code: "waitrose",
+    name: "Waitrose",
+    supportsIndexing: true,
+    supportsPriceScraping: false,
+    defaultSitemapUrls: ["https://www.waitrose.com/sitemapIndex.xml"],
+    productUrlPattern: /waitrose\.com\/ecom\/products\/[^/?#]+\/[\d-]+(?:$|[/?#])/i,
+    extractProductId(url) {
+      return /\/ecom\/products\/[^/]+\/([\d-]+)/i.exec(url)?.[1] ?? null;
+    },
+  },
 };
 
 function unsupported(code: SupermarketCode, name: string): Adapter {
@@ -99,6 +153,7 @@ function unsupported(code: SupermarketCode, name: string): Adapter {
     supportsPriceScraping: false,
     defaultSitemapUrls: [],
     productUrlPattern: /$a/,
+    pageType: "product",
     extractProductId: () => null,
   };
 }
@@ -161,6 +216,61 @@ function locsFromXml(xml: string): string[] {
 
 function isLikelySitemap(url: string) {
   return /sitemap|\.xml(?:$|\?)/i.test(url);
+}
+
+async function fetchSourceText(url: string, adapter: Adapter) {
+  const response = await fetch(url, {
+    headers: {
+      accept: "application/xml,text/xml,text/plain,*/*",
+      "user-agent": "CetiaDataServices/1.0 supermarket page indexer",
+    },
+    signal: AbortSignal.timeout(45_000),
+  });
+  const text = await response.text();
+  if (response.ok) {
+    return {
+      ok: true,
+      status: response.status,
+      text,
+      fetchMethod: "direct",
+      contentType: response.headers.get("content-type"),
+    };
+  }
+
+  if ([401, 403, 429].includes(response.status)) {
+    try {
+      const bright = await fetchViaBrightData(url, {
+        render: false,
+        rawTimeoutMs: 45_000,
+        timeoutMs: 45_000,
+        maxRetries: 1,
+        emptyHtmlRetryCount: 0,
+      });
+      if (bright.ok && bright.html.trim()) {
+        return {
+          ok: true,
+          status: bright.status,
+          text: bright.html,
+          fetchMethod: "brightdata_raw",
+          contentType: bright.contentType ?? null,
+        };
+      }
+    } catch (error) {
+      console.warn("[supermarketIndexer] Bright Data sitemap fallback failed", {
+        supermarket_code: adapter.code,
+        url,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return {
+    ok: false,
+    status: response.status,
+    text,
+    fetchMethod: "direct",
+    contentType: response.headers.get("content-type"),
+  };
 }
 
 async function createRun(
@@ -385,20 +495,14 @@ export async function indexSupermarketPages(
     sitemapUrlsProcessed += 1;
 
     try {
-      const response = await fetch(sitemapUrl, {
-        headers: {
-          accept: "application/xml,text/xml,text/plain,*/*",
-          "user-agent": "CetiaDataServices/1.0 supermarket page indexer",
-        },
-        signal: AbortSignal.timeout(45_000),
-      });
-      const text = await response.text();
-      if (!response.ok) {
+      const source = await fetchSourceText(sitemapUrl, adapter);
+      const text = source.text;
+      if (!source.ok) {
         const item = {
           url: sitemapUrl,
-          http_status: response.status,
+          http_status: source.status,
           error_code: "SUPERMARKET_SITEMAP_FETCH_FAILED",
-          error_message: `${adapter.name} sitemap fetch failed with HTTP ${response.status}`,
+          error_message: `${adapter.name} sitemap fetch failed with HTTP ${source.status}`,
         };
         errors.push(item);
         await logIndexError(supabase, adapter, runId, item);
@@ -452,6 +556,7 @@ export async function indexSupermarketPages(
             pending_sitemap_urls: queue,
             urls_discovered_so_far: pages.length,
             failed_source_segments: errors,
+            last_fetch_method: source.fetchMethod,
           },
           last_message: `${adapter.name} indexing scanned ${sitemapUrlsProcessed} sitemap(s), found ${pages.length} product page(s)`,
         });
@@ -490,7 +595,7 @@ export async function indexSupermarketPages(
       sitemap_url: page.sitemap_url,
       page_url: page.page_url,
       product_id: page.product_id,
-      page_type: "product",
+      page_type: adapter.pageType ?? "product",
       index_status: "indexed",
       scrape_status: "pending",
       raw_index_data: {
