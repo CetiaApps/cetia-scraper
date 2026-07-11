@@ -115,7 +115,7 @@ export const supermarketAdapters: Record<SupermarketCode, Adapter> = {
     supportsIndexing: true,
     supportsPriceScraping: false,
     defaultSitemapUrls: ["https://www.ocado.com/sitemaps/sitemap_index.xml"],
-    productUrlPattern: /ocado\.com\/products\/[^/?#]+\/\d+(?:$|[/?#])/i,
+    productUrlPattern: /ocado\.com\/products\/.+\/\d+(?:$|[/?#])/i,
     extractProductId(url) {
       return /\/products\/[^/]+\/(\d+)/i.exec(url)?.[1] ?? null;
     },
@@ -128,8 +128,8 @@ export const supermarketAdapters: Record<SupermarketCode, Adapter> = {
     defaultSitemapUrls: ["https://www.sainsburys.co.uk/sitemap.xml"],
     productUrlPattern: /sainsburys\.co\.uk\/gol-ui\/groceries\/[^?#]+\/c:\d+/i,
     pageType: "category",
-    extractProductId(url) {
-      return /\/c:(\d+)/i.exec(url)?.[1] ?? null;
+    extractProductId() {
+      return null;
     },
   },
   waitrose: {

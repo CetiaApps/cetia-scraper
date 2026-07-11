@@ -5,6 +5,7 @@ import {
   indexSupermarketPages,
   type SupermarketCode,
 } from "../services/supermarketAdapters.js";
+import { createSupabaseServiceClient } from "../services/supabase.js";
 
 export const supermarketAutomationRouter = Router();
 
@@ -39,12 +40,33 @@ supermarketAutomationRouter.post(
           return;
         }
 
-        void indexSupermarketPages(adapter.code as SupermarketCode, body).catch((error) => {
+        void indexSupermarketPages(adapter.code as SupermarketCode, body).catch(async (error) => {
+          const message = error instanceof Error ? error.message : String(error);
           console.error("[supermarketAutomation] Detached sitemap indexer failed", {
             supermarket_code: adapter.code,
             run_id: runId,
-            error: error instanceof Error ? error.message : String(error),
+            error: message,
           });
+          try {
+            const supabase = createSupabaseServiceClient();
+            await supabase
+              .from("supermarket_price_scrape_runs")
+              .update({
+                status: "failed",
+                phase: "page_index_failed",
+                last_message: `${adapter.name} sitemap indexer failed after dispatch`,
+                last_error: message.slice(0, 1000),
+                finished_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", runId);
+          } catch (updateError) {
+            console.error("[supermarketAutomation] Failed to mark detached index run failed", {
+              supermarket_code: adapter.code,
+              run_id: runId,
+              error: updateError instanceof Error ? updateError.message : String(updateError),
+            });
+          }
         });
 
         res.status(202).json({
