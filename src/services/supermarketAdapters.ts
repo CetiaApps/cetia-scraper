@@ -64,10 +64,10 @@ export const supermarketAdapters: Record<SupermarketCode, Adapter> = {
     name: "Aldi",
     supportsIndexing: true,
     supportsPriceScraping: false,
-    defaultSitemapUrls: ["https://www.aldi.co.uk/sitemap.xml"],
-    productUrlPattern: /aldi\.co\.uk\/.+\/p\/[a-z0-9-]+/i,
+    defaultSitemapUrls: ["https://www.aldi.co.uk/sitemap_products.xml"],
+    productUrlPattern: /aldi\.co\.uk\/product\/[^/?#]+-\d+(?:$|[/?#])/i,
     extractProductId(url) {
-      return /\/p\/([a-z0-9-]+)/i.exec(url)?.[1] ?? null;
+      return /-(\d+)(?:$|[/?#])/i.exec(url)?.[1] ?? null;
     },
   },
   asda: unsupported("asda", "ASDA"),
