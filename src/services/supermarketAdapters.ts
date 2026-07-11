@@ -359,6 +359,7 @@ async function loadDatabasePages(supabase: SupabaseClient, code: SupermarketCode
       .from("supermarket_page_index")
       .select("page_url,product_id")
       .eq("supermarket_code", code)
+      .order("page_url", { ascending: true })
       .range(from, from + 999);
     if (error) throw new Error(error.message);
     rows.push(...((data ?? []) as Array<{ page_url: string; product_id: string | null }>));
