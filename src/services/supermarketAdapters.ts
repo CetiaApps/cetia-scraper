@@ -1,5 +1,11 @@
 import { createSupabaseServiceClient } from "./supabase.js";
 import { fetchViaBrightData } from "./brightdata.js";
+import {
+  SCRAPE_SCOPE_CLASSIFIER_VERSION,
+  buildScrapeScopeInputHash,
+  classifyScrapeScope,
+  type ScrapeScopeResult,
+} from "./scrapeScopeClassifier.js";
 
 type SupabaseClient = ReturnType<typeof createSupabaseServiceClient>;
 
@@ -280,11 +286,116 @@ async function upsertIndexedPages(
       .upsert(batch, { onConflict: "supermarket_code,page_url" });
     if (error) throw new Error(error.message);
 
+    await classifyIndexedPageBatch(supabase, adapter, batchPages);
+
     written += batch.length;
     productPages += batchPages.filter((page) => page.page_type === "product").length;
   }
 
   return { written, productPages };
+}
+
+function scopeInputForPage(adapter: Adapter, page: IndexedPageCandidate) {
+  const raw = page.raw_index_data ?? {};
+  const rawString = (key: string) => {
+    const value = raw[key];
+    return typeof value === "string" && value.trim() ? value.trim() : null;
+  };
+  return {
+    supermarket_code: adapter.code,
+    page_url: page.page_url,
+    product_id: page.product_id,
+    product_name: rawString("product_name"),
+    category: rawString("category"),
+    category_path: rawString("category_path"),
+    source_category_id: rawString("source_category_id"),
+    source_category_url: rawString("source_category_url"),
+    raw_index_data: raw,
+  };
+}
+
+async function classifyIndexedPageBatch(
+  supabase: SupabaseClient,
+  adapter: Adapter,
+  pages: IndexedPageCandidate[],
+) {
+  const productPages = pages.filter((page) => page.page_type === "product");
+  if (productPages.length === 0) return {
+    eligible: 0,
+    excluded: 0,
+    review: 0,
+    unknown: 0,
+    skipped: pages.length,
+  };
+
+  const urls = productPages.map((page) => page.page_url);
+  const { data, error } = await supabase
+    .from("supermarket_page_index")
+    .select("id,page_url,scrape_scope,scope_classifier_version,scope_input_hash,scope_reviewed_at")
+    .eq("supermarket_code", adapter.code)
+    .in("page_url", urls);
+  if (error) throw new Error(error.message);
+
+  const rowsByUrl = new Map(
+    ((data ?? []) as Array<{
+      id: string;
+      page_url: string;
+      scrape_scope: string;
+      scope_classifier_version: string | null;
+      scope_input_hash: string | null;
+      scope_reviewed_at: string | null;
+    }>).map((row) => [row.page_url, row]),
+  );
+  const updates: Array<ScrapeScopeResult & { id: string }> = [];
+  let skipped = 0;
+
+  for (const page of productPages) {
+    const row = rowsByUrl.get(page.page_url);
+    if (!row || row.scope_reviewed_at) {
+      skipped += 1;
+      continue;
+    }
+    const input = scopeInputForPage(adapter, page);
+    const inputHash = buildScrapeScopeInputHash(input);
+    if (
+      row.scope_classifier_version === SCRAPE_SCOPE_CLASSIFIER_VERSION &&
+      row.scope_input_hash === inputHash &&
+      row.scrape_scope !== "unknown"
+    ) {
+      skipped += 1;
+      continue;
+    }
+    updates.push({
+      id: row.id,
+      ...classifyScrapeScope(input),
+    });
+  }
+
+  const counts = { eligible: 0, excluded: 0, review: 0, unknown: 0, skipped };
+  for (const update of updates) {
+    counts[update.scrape_scope] += 1;
+  }
+
+  for (let index = 0; index < updates.length; index += 500) {
+    const patch = updates.slice(index, index + 500).map((row) => ({
+      id: row.id,
+      scrape_scope: row.scrape_scope,
+      scope_category: row.scope_category,
+      scope_reason: row.scope_reason,
+      scope_confidence: row.scope_confidence,
+      scope_classifier_version: row.scope_classifier_version,
+      scope_input_hash: row.scope_input_hash,
+      scope_rule_id: row.scope_rule_id,
+      scope_metadata: row.scope_metadata,
+      scope_classified_at: new Date().toISOString(),
+    }));
+    const { error: updateError } = await supabase
+      .from("supermarket_page_index")
+      .upsert(patch, { onConflict: "id" });
+    if (updateError) throw new Error(updateError.message);
+  }
+
+  return counts;
 }
 
 async function fetchSainsburysShelfProducts(
@@ -989,53 +1100,28 @@ export async function indexSupermarketPages(
   const newUrlsInserted = pages.length - existingUrlsCount;
   const urlsUpdated = existingUrlsCount;
 
-  let written = 0;
-  let writtenProductPages = 0;
-  for (let index = 0; index < pages.length; index += 500) {
-    const batch = pages.slice(index, index + 500).map((page) => ({
-      run_id: runId,
-      supermarket_code: adapter.code,
-      supermarket_name: adapter.name,
-      sitemap_url: page.sitemap_url,
-      page_url: page.page_url,
-      product_id: page.product_id,
-      page_type: page.page_type,
-      index_status: "indexed",
-      scrape_status: page.page_type === "product" ? "pending" : "not_applicable",
-      raw_index_data: {
-        source: "railway_supermarket_indexer",
-        supermarket_code: adapter.code,
-        indexed_at: new Date().toISOString(),
-        ...(page.raw_index_data ?? {}),
-      },
-      updated_at: new Date().toISOString(),
-    }));
-    const { error } = await supabase
-      .from("supermarket_page_index")
-      .upsert(batch, { onConflict: "supermarket_code,page_url" });
-    if (error) throw new Error(error.message);
-    written += batch.length;
-    writtenProductPages += pages
-      .slice(index, index + 500)
-      .filter((page) => page.page_type === "product").length;
-
-    await updateRun(supabase, runId, {
-      pages_indexed: written,
-      pages_pending: writtenProductPages,
-      last_message: `${adapter.name} wrote ${written}/${pages.length} indexed URL(s), including ${writtenProductPages} product URL(s)`,
-      checkpoint_metadata: {
-        completed_sitemap_urls: [...seenSitemaps],
-        pending_sitemap_urls: queue,
-        urls_discovered_so_far: pages.length,
-        last_successful_database_batch: index + batch.length,
-        failed_source_segments: errors,
-      },
-    });
-  }
+  const writtenResult = await upsertIndexedPages(supabase, adapter, runId, pages);
+  const written = writtenResult.written;
+  const writtenProductPages = writtenResult.productPages;
 
   const databaseRowsAfter = await loadDatabasePages(supabase, adapter.code);
   const databaseTotalAfter = databaseRowsAfter.length;
   const databaseProductRowsAfter = databaseRowsAfter.filter((row) => row.page_type === "product").length;
+  const { data: scopeRows, error: scopeError } = await supabase
+    .from("supermarket_page_index")
+    .select("scrape_scope")
+    .eq("supermarket_code", adapter.code)
+    .eq("page_type", "product");
+  if (scopeError) throw new Error(scopeError.message);
+  const scopeSummary = {
+    eligible: 0,
+    excluded: 0,
+    review: 0,
+    unknown: 0,
+  };
+  for (const row of (scopeRows ?? []) as Array<{ scrape_scope: keyof typeof scopeSummary }>) {
+    if (row.scrape_scope in scopeSummary) scopeSummary[row.scrape_scope] += 1;
+  }
   const expectedUrlSet = new Set(pages.map((page) => page.normalized_page_url));
   if (adapter.code === "sainsburys") {
     for (const url of existingUrlSet) expectedUrlSet.add(url);
@@ -1149,6 +1235,8 @@ export async function indexSupermarketPages(
       urls_discovered_so_far: pages.length,
       sainsburys_product_urls_discovered: sainsburysProductPageCount,
       sainsburys_effective_product_urls: effectiveSainsburysProductPageCount,
+      scrape_scope_summary: scopeSummary,
+      scrape_scope_classifier_version: SCRAPE_SCOPE_CLASSIFIER_VERSION,
       failed_source_segments: compactErrors(errors),
       details_limited_to: 5000,
     },
