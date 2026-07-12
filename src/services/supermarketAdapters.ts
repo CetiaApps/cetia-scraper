@@ -455,12 +455,7 @@ async function fetchSainsburysShelfProducts(
 
   try {
     const response = await fetch(apiUrl, {
-      headers: {
-        accept: "application/json,text/plain,*/*",
-        referer: categoryUrl,
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-        "x-requested-with": "XMLHttpRequest",
-      },
+      headers: sainsburysApiHeaders(categoryUrl),
       signal: AbortSignal.timeout(30_000),
     });
     status = response.status;
@@ -479,14 +474,32 @@ async function fetchSainsburysShelfProducts(
       maxRetries: 1,
       emptyHtmlRetryCount: 1,
       emptyHtmlRetryDelayMs: 1_000,
+      headers: sainsburysApiHeaders(categoryUrl),
     });
     status = bright.status;
     text = bright.html;
     fetchMethod = "brightdata_raw";
-    if (!bright.ok || !text.trim()) {
+    if (!bright.ok || !text.trim() || !/^\s*[{[]/.test(text)) {
+      const rendered = await fetchViaBrightData(apiUrl.toString(), {
+        render: true,
+        rawTimeoutMs: 45_000,
+        renderTimeoutMs: 90_000,
+        timeoutMs: 90_000,
+        renderWaitMs: 8_000,
+        maxRetries: 0,
+        emptyHtmlRetryCount: 1,
+        emptyHtmlRetryDelayMs: 1_000,
+        headers: sainsburysApiHeaders(categoryUrl),
+        waitStrategy: "brightdata-render-sainsburys-product-api",
+      });
+      status = rendered.status || status;
+      text = rendered.html;
+      fetchMethod = "brightdata_render";
+    }
+    if (!text.trim() || !/^\s*[{[]/.test(text)) {
       const directMessage = directError instanceof Error ? directError.message : String(directError);
       throw new Error(
-        `Sainsbury product API failed via direct (${directMessage}) and Bright Data HTTP ${bright.status || "unknown"}`,
+        `Sainsbury product API failed via direct (${directMessage}) and ${fetchMethod} HTTP ${status || "unknown"} non-json body: ${text.slice(0, 160)}`,
       );
     }
   }
@@ -706,6 +719,25 @@ function isLikelySitemap(url: string) {
   return /sitemap|\.xml(?:$|\?)/i.test(url);
 }
 
+const BROWSER_HEADERS = {
+  accept: "application/xml,text/xml,text/plain,text/html,application/xhtml+xml,application/json,*/*",
+  "accept-language": "en-GB,en;q=0.9",
+  "cache-control": "no-cache",
+  pragma: "no-cache",
+  "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+};
+
+function sainsburysApiHeaders(categoryUrl: string) {
+  return {
+    accept: "application/json,text/plain,*/*",
+    "accept-language": "en-GB,en;q=0.9",
+    origin: "https://www.sainsburys.co.uk",
+    referer: categoryUrl,
+    "user-agent": BROWSER_HEADERS["user-agent"],
+    "x-requested-with": "XMLHttpRequest",
+  };
+}
+
 async function fetchSourceViaBrightData(url: string, adapter: Adapter) {
   try {
     const bright = await fetchViaBrightData(url, {
@@ -714,6 +746,7 @@ async function fetchSourceViaBrightData(url: string, adapter: Adapter) {
       timeoutMs: 45_000,
       maxRetries: 1,
       emptyHtmlRetryCount: 0,
+      headers: BROWSER_HEADERS,
     });
     if (bright.ok && bright.html.trim()) {
       return {
@@ -736,10 +769,7 @@ async function fetchSourceViaBrightData(url: string, adapter: Adapter) {
 
 async function fetchSourceText(url: string, adapter: Adapter) {
   const response = await fetch(url, {
-    headers: {
-      accept: "application/xml,text/xml,text/plain,*/*",
-      "user-agent": "CetiaDataServices/1.0 supermarket page indexer",
-    },
+    headers: BROWSER_HEADERS,
     signal: AbortSignal.timeout(45_000),
   });
   const text = await response.text();

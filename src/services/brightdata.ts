@@ -25,6 +25,7 @@ export interface BrightDataFetchOptions {
   emptyHtmlRetryDelayMs?: number;
   retryBaseDelayMs?: number;
   waitStrategy?: string;
+  headers?: Record<string, string>;
 }
 
 export interface BrightDataFetchResult {
@@ -182,10 +183,12 @@ export async function fetchTescoHtmlViaBrightData(
         zone,
         url,
         format: "raw",
+        ...(options.headers ? { headers: options.headers } : {}),
         ...(render
           ? {
               render: "true",
               headers: {
+                ...(options.headers ?? {}),
                 "x-unblock-expect": renderExpectHeader(),
               },
             }
