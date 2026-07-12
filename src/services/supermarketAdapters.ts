@@ -467,37 +467,52 @@ async function fetchSainsburysShelfProducts(
       throw new Error(`Sainsbury product API failed with HTTP ${response.status}`);
     }
   } catch (directError) {
-    const bright = await fetchViaBrightData(apiUrl.toString(), {
-      render: false,
-      rawTimeoutMs: 45_000,
-      timeoutMs: 45_000,
-      maxRetries: 1,
-      emptyHtmlRetryCount: 1,
-      emptyHtmlRetryDelayMs: 1_000,
-      headers: sainsburysApiHeaders(categoryUrl),
+    const directMessage = directError instanceof Error ? directError.message : String(directError);
+    console.warn("[supermarketIndexer] Sainsbury direct product API failed; trying Bright Data", {
+      category_url: categoryUrl,
+      category_id: categoryId,
+      page_number: pageNumber,
+      error: directMessage,
     });
-    status = bright.status;
-    text = bright.html;
-    fetchMethod = "brightdata_raw";
-    if (!bright.ok || !text.trim() || !/^\s*[{[]/.test(text)) {
-      const rendered = await fetchViaBrightData(apiUrl.toString(), {
-        render: true,
+
+    try {
+      const bright = await fetchViaBrightData(apiUrl.toString(), {
+        render: false,
         rawTimeoutMs: 45_000,
-        renderTimeoutMs: 90_000,
-        timeoutMs: 90_000,
-        renderWaitMs: 8_000,
-        maxRetries: 0,
+        timeoutMs: 45_000,
+        maxRetries: 1,
         emptyHtmlRetryCount: 1,
         emptyHtmlRetryDelayMs: 1_000,
         headers: sainsburysApiHeaders(categoryUrl),
-        waitStrategy: "brightdata-render-sainsburys-product-api",
       });
-      status = rendered.status || status;
-      text = rendered.html;
-      fetchMethod = "brightdata_render";
+      status = bright.status;
+      text = bright.html;
+      fetchMethod = "brightdata_raw";
+      if (!bright.ok || !text.trim() || !/^\s*[{[]/.test(text)) {
+        const rendered = await fetchViaBrightData(apiUrl.toString(), {
+          render: true,
+          rawTimeoutMs: 45_000,
+          renderTimeoutMs: 90_000,
+          timeoutMs: 90_000,
+          renderWaitMs: 8_000,
+          maxRetries: 0,
+          emptyHtmlRetryCount: 1,
+          emptyHtmlRetryDelayMs: 1_000,
+          headers: sainsburysApiHeaders(categoryUrl),
+          waitStrategy: "brightdata-render-sainsburys-product-api",
+        });
+        status = rendered.status || status;
+        text = rendered.html;
+        fetchMethod = "brightdata_render";
+      }
+    } catch (brightError) {
+      const brightMessage = brightError instanceof Error ? brightError.message : String(brightError);
+      throw new Error(
+        `Sainsbury product API failed via direct (${directMessage}) and Bright Data fallback (${fetchMethod}) failed: ${brightMessage}`,
+      );
     }
+
     if (!text.trim() || !/^\s*[{[]/.test(text)) {
-      const directMessage = directError instanceof Error ? directError.message : String(directError);
       throw new Error(
         `Sainsbury product API failed via direct (${directMessage}) and ${fetchMethod} HTTP ${status || "unknown"} non-json body: ${text.slice(0, 160)}`,
       );
