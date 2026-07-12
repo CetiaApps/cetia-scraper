@@ -357,7 +357,7 @@ async function classifyIndexedPageBatch(
     skipped: pages.length,
   };
 
-  const updates: Array<ScrapeScopeResult & { id: string }> = [];
+  const updates: Array<ScrapeScopeResult & { id: string; page_url: string }> = [];
   let skipped = 0;
 
   for (let index = 0; index < productPages.length; index += 50) {
@@ -399,6 +399,7 @@ async function classifyIndexedPageBatch(
       }
       updates.push({
         id: row.id,
+        page_url: row.page_url,
         ...classifyScrapeScope(input),
       });
     }
@@ -409,10 +410,12 @@ async function classifyIndexedPageBatch(
     counts[update.scrape_scope] += 1;
   }
 
-  for (const row of updates) {
-    const { error: updateError } = await supabase
-      .from("supermarket_page_index")
-      .update({
+  for (let index = 0; index < updates.length; index += 100) {
+    const patch = updates.slice(index, index + 100).map((row) => ({
+        id: row.id,
+        supermarket_code: adapter.code,
+        page_url: row.page_url,
+        page_type: "product",
         scrape_scope: row.scrape_scope,
         scope_category: row.scope_category,
         scope_reason: row.scope_reason,
@@ -422,8 +425,10 @@ async function classifyIndexedPageBatch(
         scope_rule_id: row.scope_rule_id,
         scope_metadata: row.scope_metadata,
         scope_classified_at: new Date().toISOString(),
-      })
-      .eq("id", row.id);
+      }));
+    const { error: updateError } = await supabase
+      .from("supermarket_page_index")
+      .upsert(patch, { onConflict: "id" });
     if (updateError) throw new Error(formatSupabaseError(updateError));
   }
 
