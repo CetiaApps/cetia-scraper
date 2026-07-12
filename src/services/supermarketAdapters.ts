@@ -8,6 +8,12 @@ import {
 } from "./scrapeScopeClassifier.js";
 
 type SupabaseClient = ReturnType<typeof createSupabaseServiceClient>;
+type SupabaseErrorLike = {
+  message?: string;
+  code?: string;
+  details?: string;
+  hint?: string;
+};
 
 export const ACTIVE_SUPERMARKETS = [
   { code: "tesco", name: "Tesco" },
@@ -186,6 +192,18 @@ function clampInt(value: unknown, fallback: number, min: number, max: number) {
   return Math.min(Math.max(Math.floor(n), min), max);
 }
 
+function formatSupabaseError(error: SupabaseErrorLike | null | undefined): string {
+  if (!error) return "Unknown Supabase error";
+  return [
+    error.message,
+    error.code ? `code=${error.code}` : null,
+    error.details ? `details=${error.details}` : null,
+    error.hint ? `hint=${error.hint}` : null,
+  ]
+    .filter(Boolean)
+    .join(" | ");
+}
+
 function runModeValue(value: unknown): "full" | "limited_test" | "resume" {
   return value === "limited_test" || value === "resume" ? value : "full";
 }
@@ -284,9 +302,18 @@ async function upsertIndexedPages(
     const { error } = await supabase
       .from("supermarket_page_index")
       .upsert(batch, { onConflict: "supermarket_code,page_url" });
-    if (error) throw new Error(error.message);
+    if (error) throw new Error(formatSupabaseError(error));
 
-    await classifyIndexedPageBatch(supabase, adapter, batchPages);
+    try {
+      await classifyIndexedPageBatch(supabase, adapter, batchPages);
+    } catch (error) {
+      console.warn("[supermarketIndexer] Page scope classification failed for batch", {
+        supermarket_code: adapter.code,
+        run_id: runId,
+        batch_size: batchPages.length,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
 
     written += batch.length;
     productPages += batchPages.filter((page) => page.page_type === "product").length;
@@ -334,7 +361,7 @@ async function classifyIndexedPageBatch(
     .select("id,page_url,scrape_scope,scope_classifier_version,scope_input_hash,scope_reviewed_at")
     .eq("supermarket_code", adapter.code)
     .in("page_url", urls);
-  if (error) throw new Error(error.message);
+  if (error) throw new Error(formatSupabaseError(error));
 
   const rowsByUrl = new Map(
     ((data ?? []) as Array<{
@@ -392,7 +419,7 @@ async function classifyIndexedPageBatch(
     const { error: updateError } = await supabase
       .from("supermarket_page_index")
       .upsert(patch, { onConflict: "id" });
-    if (updateError) throw new Error(updateError.message);
+    if (updateError) throw new Error(formatSupabaseError(updateError));
   }
 
   return counts;
@@ -765,7 +792,7 @@ async function createRun(
     .select("id")
     .single();
 
-  if (error || !data) throw new Error(error?.message || "Failed to create index run");
+  if (error || !data) throw new Error(error ? formatSupabaseError(error) : "Failed to create index run");
   return String(data.id);
 }
 
@@ -782,7 +809,7 @@ async function updateRun(
       updated_at: new Date().toISOString(),
     })
     .eq("id", runId);
-  if (error) throw new Error(error.message);
+  if (error) throw new Error(formatSupabaseError(error));
 }
 
 async function logIndexError(
@@ -809,7 +836,7 @@ async function countDatabasePages(supabase: SupabaseClient, code: SupermarketCod
     .from("supermarket_page_index")
     .select("id", { count: "exact", head: true })
     .eq("supermarket_code", code);
-  if (error) throw new Error(error.message);
+  if (error) throw new Error(formatSupabaseError(error));
   return count ?? 0;
 }
 
@@ -822,7 +849,7 @@ async function loadDatabasePages(supabase: SupabaseClient, code: SupermarketCode
       .eq("supermarket_code", code)
       .order("page_url", { ascending: true })
       .range(from, from + 999);
-    if (error) throw new Error(error.message);
+    if (error) throw new Error(formatSupabaseError(error));
     rows.push(...((data ?? []) as Array<{ page_url: string; product_id: string | null; page_type: string | null }>));
     if (!data || data.length < 1000) break;
   }
@@ -863,7 +890,7 @@ async function writeReconciliationDetails(
     const { error } = await supabase
       .from("supermarket_index_reconciliation_details")
       .insert(batch);
-    if (error) throw new Error(error.message);
+    if (error) throw new Error(formatSupabaseError(error));
   }
 }
 
@@ -1112,7 +1139,7 @@ export async function indexSupermarketPages(
     .select("scrape_scope")
     .eq("supermarket_code", adapter.code)
     .eq("page_type", "product");
-  if (scopeError) throw new Error(scopeError.message);
+  if (scopeError) throw new Error(formatSupabaseError(scopeError));
   const scopeSummary = {
     eligible: 0,
     excluded: 0,
