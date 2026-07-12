@@ -355,47 +355,51 @@ async function classifyIndexedPageBatch(
     skipped: pages.length,
   };
 
-  const urls = productPages.map((page) => page.page_url);
-  const { data, error } = await supabase
-    .from("supermarket_page_index")
-    .select("id,page_url,scrape_scope,scope_classifier_version,scope_input_hash,scope_reviewed_at")
-    .eq("supermarket_code", adapter.code)
-    .in("page_url", urls);
-  if (error) throw new Error(formatSupabaseError(error));
-
-  const rowsByUrl = new Map(
-    ((data ?? []) as Array<{
-      id: string;
-      page_url: string;
-      scrape_scope: string;
-      scope_classifier_version: string | null;
-      scope_input_hash: string | null;
-      scope_reviewed_at: string | null;
-    }>).map((row) => [row.page_url, row]),
-  );
   const updates: Array<ScrapeScopeResult & { id: string }> = [];
   let skipped = 0;
 
-  for (const page of productPages) {
-    const row = rowsByUrl.get(page.page_url);
-    if (!row || row.scope_reviewed_at) {
-      skipped += 1;
-      continue;
+  for (let index = 0; index < productPages.length; index += 50) {
+    const chunk = productPages.slice(index, index + 50);
+    const urls = chunk.map((page) => page.page_url);
+    const { data, error } = await supabase
+      .from("supermarket_page_index")
+      .select("id,page_url,scrape_scope,scope_classifier_version,scope_input_hash,scope_reviewed_at")
+      .eq("supermarket_code", adapter.code)
+      .in("page_url", urls);
+    if (error) throw new Error(formatSupabaseError(error));
+
+    const rowsByUrl = new Map(
+      ((data ?? []) as Array<{
+        id: string;
+        page_url: string;
+        scrape_scope: string;
+        scope_classifier_version: string | null;
+        scope_input_hash: string | null;
+        scope_reviewed_at: string | null;
+      }>).map((row) => [row.page_url, row]),
+    );
+
+    for (const page of chunk) {
+      const row = rowsByUrl.get(page.page_url);
+      if (!row || row.scope_reviewed_at) {
+        skipped += 1;
+        continue;
+      }
+      const input = scopeInputForPage(adapter, page);
+      const inputHash = buildScrapeScopeInputHash(input);
+      if (
+        row.scope_classifier_version === SCRAPE_SCOPE_CLASSIFIER_VERSION &&
+        row.scope_input_hash === inputHash &&
+        row.scrape_scope !== "unknown"
+      ) {
+        skipped += 1;
+        continue;
+      }
+      updates.push({
+        id: row.id,
+        ...classifyScrapeScope(input),
+      });
     }
-    const input = scopeInputForPage(adapter, page);
-    const inputHash = buildScrapeScopeInputHash(input);
-    if (
-      row.scope_classifier_version === SCRAPE_SCOPE_CLASSIFIER_VERSION &&
-      row.scope_input_hash === inputHash &&
-      row.scrape_scope !== "unknown"
-    ) {
-      skipped += 1;
-      continue;
-    }
-    updates.push({
-      id: row.id,
-      ...classifyScrapeScope(input),
-    });
   }
 
   const counts = { eligible: 0, excluded: 0, review: 0, unknown: 0, skipped };
