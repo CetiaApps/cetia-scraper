@@ -74,6 +74,8 @@ interface IndexedPageCandidate {
   raw_index_data?: Record<string, unknown>;
 }
 
+const SAINSBURYS_ERROR_SAMPLE_LIMIT = 50;
+
 export const supermarketAdapters: Record<SupermarketCode, Adapter> = {
   tesco: {
     code: "tesco",
@@ -235,6 +237,56 @@ function sainsburysProductUrl(product: Record<string, unknown>): string | null {
   return normalizeProductUrl(candidate, "https://www.sainsburys.co.uk");
 }
 
+function compactErrors(errors: SupermarketIndexResult["errors"]) {
+  return errors.slice(0, SAINSBURYS_ERROR_SAMPLE_LIMIT);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function upsertIndexedPages(
+  supabase: SupabaseClient,
+  adapter: Adapter,
+  runId: string,
+  pages: IndexedPageCandidate[],
+) {
+  if (pages.length === 0) return { written: 0, productPages: 0 };
+
+  let written = 0;
+  let productPages = 0;
+  for (let index = 0; index < pages.length; index += 500) {
+    const batchPages = pages.slice(index, index + 500);
+    const batch = batchPages.map((page) => ({
+      run_id: runId,
+      supermarket_code: adapter.code,
+      supermarket_name: adapter.name,
+      sitemap_url: page.sitemap_url,
+      page_url: page.page_url,
+      product_id: page.product_id,
+      page_type: page.page_type,
+      index_status: "indexed",
+      scrape_status: page.page_type === "product" ? "pending" : "not_applicable",
+      raw_index_data: {
+        source: "railway_supermarket_indexer",
+        supermarket_code: adapter.code,
+        indexed_at: new Date().toISOString(),
+        ...(page.raw_index_data ?? {}),
+      },
+      updated_at: new Date().toISOString(),
+    }));
+    const { error } = await supabase
+      .from("supermarket_page_index")
+      .upsert(batch, { onConflict: "supermarket_code,page_url" });
+    if (error) throw new Error(error.message);
+
+    written += batch.length;
+    productPages += batchPages.filter((page) => page.page_type === "product").length;
+  }
+
+  return { written, productPages };
+}
+
 async function fetchSainsburysShelfProducts(
   categoryUrl: string,
   categoryId: string,
@@ -249,17 +301,46 @@ async function fetchSainsburysShelfProducts(
   apiUrl.searchParams.set("hfss_restricted", "false");
   apiUrl.searchParams.set("use_cached_results", "true");
 
-  const response = await fetch(apiUrl, {
-    headers: {
-      accept: "application/json,text/plain,*/*",
-      referer: categoryUrl,
-      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-    },
-    signal: AbortSignal.timeout(30_000),
-  });
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`Sainsbury product API failed with HTTP ${response.status}`);
+  let text = "";
+  let status = 0;
+  let fetchMethod = "direct";
+
+  try {
+    const response = await fetch(apiUrl, {
+      headers: {
+        accept: "application/json,text/plain,*/*",
+        referer: categoryUrl,
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+        "x-requested-with": "XMLHttpRequest",
+      },
+      signal: AbortSignal.timeout(30_000),
+    });
+    status = response.status;
+    text = await response.text();
+    if (!response.ok && [403, 429, 500, 502, 503, 504].includes(response.status)) {
+      throw new Error(`direct HTTP ${response.status}`);
+    }
+    if (!response.ok) {
+      throw new Error(`Sainsbury product API failed with HTTP ${response.status}`);
+    }
+  } catch (directError) {
+    const bright = await fetchViaBrightData(apiUrl.toString(), {
+      render: false,
+      rawTimeoutMs: 45_000,
+      timeoutMs: 45_000,
+      maxRetries: 1,
+      emptyHtmlRetryCount: 1,
+      emptyHtmlRetryDelayMs: 1_000,
+    });
+    status = bright.status;
+    text = bright.html;
+    fetchMethod = "brightdata_raw";
+    if (!bright.ok || !text.trim()) {
+      const directMessage = directError instanceof Error ? directError.message : String(directError);
+      throw new Error(
+        `Sainsbury product API failed via direct (${directMessage}) and Bright Data HTTP ${bright.status || "unknown"}`,
+      );
+    }
   }
 
   let json: unknown;
@@ -284,6 +365,7 @@ async function fetchSainsburysShelfProducts(
     products,
     lastPage: Number.isFinite(lastPage) && lastPage > 0 ? Math.floor(lastPage) : pageNumber,
     totalRecordCount: Number.isFinite(totalRecordCount) ? Math.floor(totalRecordCount) : null,
+    fetchMethod,
   };
 }
 
@@ -293,15 +375,19 @@ async function expandSainsburysShelfProducts(
   runId: string,
   shelfPages: IndexedPageCandidate[],
   seenPages: Set<string>,
+  seenProductIds: Set<string>,
   maxProductPages: number | null,
   errors: SupermarketIndexResult["errors"],
   invalidDetails: Parameters<typeof writeReconciliationDetails>[3],
 ): Promise<IndexedPageCandidate[]> {
   const productPages: IndexedPageCandidate[] = [];
+  let flushedProductPages = 0;
   let shelvesProcessed = 0;
   let shelvesWithProducts = 0;
   let duplicateProducts = 0;
   let invalidProducts = 0;
+  let failedShelves = 0;
+  let loggedShelfErrors = 0;
 
   for (const shelf of shelfPages) {
     if (maxProductPages !== null && productPages.length >= maxProductPages) break;
@@ -328,6 +414,7 @@ async function expandSainsburysShelfProducts(
         lastPage = Math.max(pageNumber, response.lastPage);
         for (const product of response.products) {
           if (maxProductPages !== null && productPages.length >= maxProductPages) break;
+          const productId = sainsburysProductId(product);
           const productUrl = sainsburysProductUrl(product);
           if (!productUrl) {
             invalidProducts += 1;
@@ -338,22 +425,23 @@ async function expandSainsburysShelfProducts(
               reason: "Sainsbury product API row did not include a usable product URL",
               metadata: {
                 source_category_id: categoryId,
-                product_uid: sainsburysProductId(product),
+                product_uid: productId,
               },
             });
             continue;
           }
-          if (seenPages.has(productUrl)) {
+          if (seenPages.has(productUrl) || (productId !== null && seenProductIds.has(productId))) {
             duplicateProducts += 1;
             continue;
           }
 
           seenPages.add(productUrl);
+          if (productId !== null) seenProductIds.add(productId);
           shelfProductCount += 1;
           productPages.push({
             page_url: productUrl,
             normalized_page_url: productUrl,
-            product_id: sainsburysProductId(product),
+            product_id: productId,
             sitemap_url: shelf.sitemap_url,
             page_type: "product",
             raw_index_data: {
@@ -363,6 +451,7 @@ async function expandSainsburysShelfProducts(
               product_name: stringValue(product.name),
               image_url: stringValue(product.image),
               total_record_count: response.totalRecordCount,
+              fetch_method: response.fetchMethod,
             },
           });
         }
@@ -371,14 +460,28 @@ async function expandSainsburysShelfProducts(
 
       if (shelfProductCount > 0) shelvesWithProducts += 1;
     } catch (error) {
+      failedShelves += 1;
       const item = {
         url: shelf.page_url,
         http_status: null,
         error_code: "SAINSBURYS_SHELF_PRODUCT_INDEX_FAILED",
         error_message: error instanceof Error ? error.message : String(error),
       };
-      errors.push(item);
-      await logIndexError(supabase, adapter, runId, item);
+      if (errors.length < SAINSBURYS_ERROR_SAMPLE_LIMIT) errors.push(item);
+      if (loggedShelfErrors < SAINSBURYS_ERROR_SAMPLE_LIMIT) {
+        loggedShelfErrors += 1;
+        await logIndexError(supabase, adapter, runId, item);
+      }
+    }
+
+    if (productPages.length - flushedProductPages >= 500) {
+      const pagesToFlush = productPages.slice(flushedProductPages);
+      await upsertIndexedPages(supabase, adapter, runId, pagesToFlush);
+      flushedProductPages = productPages.length;
+      await updateRun(supabase, runId, {
+        pages_pending: flushedProductPages,
+        last_message: `Sainsbury's checkpoint wrote ${flushedProductPages} product URL(s) while expanding shelves`,
+      });
     }
 
     if (shelvesProcessed % 25 === 0) {
@@ -395,11 +498,17 @@ async function expandSainsburysShelfProducts(
           sainsburys_product_urls_discovered: productPages.length,
           sainsburys_duplicate_product_urls: duplicateProducts,
           sainsburys_invalid_product_rows: invalidProducts,
-          failed_source_segments: errors,
+          sainsburys_failed_shelf_count: failedShelves,
+          failed_source_segments: compactErrors(errors),
         },
         last_message: `Sainsbury's expanded ${shelvesProcessed}/${shelfPages.length} shelf URL(s), found ${productPages.length} product page URL(s)`,
       });
     }
+    await delay(150);
+  }
+
+  if (productPages.length > flushedProductPages) {
+    await upsertIndexedPages(supabase, adapter, runId, productPages.slice(flushedProductPages));
   }
 
   await updateRun(supabase, runId, {
@@ -410,7 +519,8 @@ async function expandSainsburysShelfProducts(
       sainsburys_product_urls_discovered: productPages.length,
       sainsburys_duplicate_product_urls: duplicateProducts,
       sainsburys_invalid_product_rows: invalidProducts,
-      failed_source_segments: errors,
+      sainsburys_failed_shelf_count: failedShelves,
+      failed_source_segments: compactErrors(errors),
     },
     last_message: `Sainsbury's shelf-to-product expansion found ${productPages.length} product page URL(s) from ${shelvesProcessed} shelf URL(s)`,
   });
@@ -593,16 +703,16 @@ async function countDatabasePages(supabase: SupabaseClient, code: SupermarketCod
 }
 
 async function loadDatabasePages(supabase: SupabaseClient, code: SupermarketCode) {
-  const rows: Array<{ page_url: string; product_id: string | null }> = [];
+  const rows: Array<{ page_url: string; product_id: string | null; page_type: string | null }> = [];
   for (let from = 0; ; from += 1000) {
     const { data, error } = await supabase
       .from("supermarket_page_index")
-      .select("page_url,product_id")
+      .select("page_url,product_id,page_type")
       .eq("supermarket_code", code)
       .order("page_url", { ascending: true })
       .range(from, from + 999);
     if (error) throw new Error(error.message);
-    rows.push(...((data ?? []) as Array<{ page_url: string; product_id: string | null }>));
+    rows.push(...((data ?? []) as Array<{ page_url: string; product_id: string | null; page_type: string | null }>));
     if (!data || data.length < 1000) break;
   }
   return rows;
@@ -830,6 +940,22 @@ export async function indexSupermarketPages(
     }
   }
 
+  const existingRowsBefore = await loadDatabasePages(supabase, adapter.code);
+  const existingUrlSet = new Set(
+    existingRowsBefore
+      .map((row) => normalizeProductUrl(row.page_url, adapter.defaultSitemapUrls[0] ?? "https://example.com"))
+      .filter((url): url is string => Boolean(url)),
+  );
+  for (const url of existingUrlSet) {
+    seenPages.add(url);
+  }
+  const seenProductIds = new Set(
+    existingRowsBefore
+      .map((row) => row.product_id)
+      .filter((productId): productId is string => Boolean(productId)),
+  );
+  const existingProductPageCount = existingRowsBefore.filter((row) => row.page_type === "product").length;
+
   if (adapter.code === "sainsburys" && pages.length > 0) {
     const shelfPages = pages.filter((page) => page.page_type === "category");
     const productLimit = maxPages;
@@ -839,6 +965,7 @@ export async function indexSupermarketPages(
       runId,
       shelfPages,
       seenPages,
+      seenProductIds,
       productLimit,
       errors,
       invalidDetails,
@@ -852,13 +979,12 @@ export async function indexSupermarketPages(
   }
 
   const sourceExhausted = queue.length === 0 && !limitReached && errors.length === 0 && seenSitemaps.size < 5000;
-  const sourceControlTotal = pages.length;
-  const existingRowsBefore = await loadDatabasePages(supabase, adapter.code);
-  const existingUrlSet = new Set(
-    existingRowsBefore
-      .map((row) => normalizeProductUrl(row.page_url, adapter.defaultSitemapUrls[0] ?? "https://example.com"))
-      .filter((url): url is string => Boolean(url)),
-  );
+  const effectiveSainsburysProductPageCount =
+    adapter.code === "sainsburys" ? existingProductPageCount + (sainsburysProductPageCount ?? 0) : null;
+  const sourceControlTotal =
+    adapter.code === "sainsburys" && effectiveSainsburysProductPageCount !== null
+      ? pages.filter((page) => page.page_type === "category").length + effectiveSainsburysProductPageCount
+      : pages.length;
   const existingUrlsCount = pages.filter((page) => existingUrlSet.has(page.normalized_page_url)).length;
   const newUrlsInserted = pages.length - existingUrlsCount;
   const urlsUpdated = existingUrlsCount;
@@ -909,7 +1035,11 @@ export async function indexSupermarketPages(
 
   const databaseRowsAfter = await loadDatabasePages(supabase, adapter.code);
   const databaseTotalAfter = databaseRowsAfter.length;
+  const databaseProductRowsAfter = databaseRowsAfter.filter((row) => row.page_type === "product").length;
   const expectedUrlSet = new Set(pages.map((page) => page.normalized_page_url));
+  if (adapter.code === "sainsburys") {
+    for (const url of existingUrlSet) expectedUrlSet.add(url);
+  }
   const databaseUrlSet = new Set(
     databaseRowsAfter
       .map((row) => normalizeProductUrl(row.page_url, adapter.defaultSitemapUrls[0] ?? "https://example.com"))
@@ -943,10 +1073,13 @@ export async function indexSupermarketPages(
   let partialReason: string | null = null;
   let message =
     adapter.code === "sainsburys"
-      ? `${adapter.name} shelf-to-product source reconciled: ${sainsburysProductPageCount ?? 0} product URL(s), ${databaseTotalAfter} indexed URL(s)`
+      ? `${adapter.name} shelf-to-product source reconciled: ${effectiveSainsburysProductPageCount ?? 0} product URL(s), ${databaseTotalAfter} indexed URL(s)`
       : `${adapter.name} source reconciled: ${sourceControlTotal} source URL(s), ${databaseTotalAfter} indexed URL(s)`;
 
-  if (pages.length === 0 || (adapter.code === "sainsburys" && (sainsburysProductPageCount ?? 0) === 0)) {
+  if (
+    pages.length === 0 ||
+    (adapter.code === "sainsburys" && (effectiveSainsburysProductPageCount ?? 0) === 0)
+  ) {
     status = "failed";
     phase = "page_index_failed";
     reconciliationStatus = errors.length > 0 ? "partial_source_failure" : "failed";
@@ -983,14 +1116,17 @@ export async function indexSupermarketPages(
   await updateRun(supabase, runId, {
     status,
     phase,
-    pages_indexed: written,
-    pages_pending: written,
+    pages_indexed: adapter.code === "sainsburys" ? databaseProductRowsAfter : written,
+    pages_pending: adapter.code === "sainsburys" ? databaseProductRowsAfter : writtenProductPages,
     source_reported_total: sourceControlTotal,
     source_control_total: sourceControlTotal,
     sitemap_count_expected: seenSitemaps.size + queue.length,
     sitemap_count_processed: sitemapUrlsProcessed,
     source_urls_discovered: sourceUrlsDiscovered,
-    unique_urls_discovered: pages.length,
+    unique_urls_discovered:
+      adapter.code === "sainsburys" && effectiveSainsburysProductPageCount !== null
+        ? effectiveSainsburysProductPageCount
+        : pages.length,
     existing_urls_count: existingUrlsCount,
     new_urls_inserted: newUrlsInserted,
     urls_updated: urlsUpdated,
@@ -1012,7 +1148,8 @@ export async function indexSupermarketPages(
       pending_sitemap_urls: queue,
       urls_discovered_so_far: pages.length,
       sainsburys_product_urls_discovered: sainsburysProductPageCount,
-      failed_source_segments: errors,
+      sainsburys_effective_product_urls: effectiveSainsburysProductPageCount,
+      failed_source_segments: compactErrors(errors),
       details_limited_to: 5000,
     },
     errors_count: errors.length,
@@ -1022,16 +1159,22 @@ export async function indexSupermarketPages(
   });
 
   return {
-    success: adapter.code === "sainsburys" ? (sainsburysProductPageCount ?? 0) > 0 : pages.length > 0,
+    success: adapter.code === "sainsburys" ? (effectiveSainsburysProductPageCount ?? 0) > 0 : pages.length > 0,
     supermarket_code: adapter.code,
     supermarket_name: adapter.name,
     run_id: runId,
-    pages_found: pages.length,
+    pages_found:
+      adapter.code === "sainsburys" && effectiveSainsburysProductPageCount !== null
+        ? effectiveSainsburysProductPageCount
+        : pages.length,
     pages_inserted_or_updated: written,
     sitemap_urls_processed: sitemapUrlsProcessed,
     errors,
     source_control_total: sourceControlTotal,
-    unique_urls_discovered: pages.length,
+    unique_urls_discovered:
+      adapter.code === "sainsburys" && effectiveSainsburysProductPageCount !== null
+        ? effectiveSainsburysProductPageCount
+        : pages.length,
     database_total_before: databaseTotalBefore,
     database_total_after: databaseTotalAfter,
     existing_urls_count: existingUrlsCount,
