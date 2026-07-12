@@ -407,22 +407,21 @@ async function classifyIndexedPageBatch(
     counts[update.scrape_scope] += 1;
   }
 
-  for (let index = 0; index < updates.length; index += 500) {
-    const patch = updates.slice(index, index + 500).map((row) => ({
-      id: row.id,
-      scrape_scope: row.scrape_scope,
-      scope_category: row.scope_category,
-      scope_reason: row.scope_reason,
-      scope_confidence: row.scope_confidence,
-      scope_classifier_version: row.scope_classifier_version,
-      scope_input_hash: row.scope_input_hash,
-      scope_rule_id: row.scope_rule_id,
-      scope_metadata: row.scope_metadata,
-      scope_classified_at: new Date().toISOString(),
-    }));
+  for (const row of updates) {
     const { error: updateError } = await supabase
       .from("supermarket_page_index")
-      .upsert(patch, { onConflict: "id" });
+      .update({
+        scrape_scope: row.scrape_scope,
+        scope_category: row.scope_category,
+        scope_reason: row.scope_reason,
+        scope_confidence: row.scope_confidence,
+        scope_classifier_version: row.scope_classifier_version,
+        scope_input_hash: row.scope_input_hash,
+        scope_rule_id: row.scope_rule_id,
+        scope_metadata: row.scope_metadata,
+        scope_classified_at: new Date().toISOString(),
+      })
+      .eq("id", row.id);
     if (updateError) throw new Error(formatSupabaseError(updateError));
   }
 
