@@ -86,6 +86,18 @@ interface IndexedPageCandidate {
   raw_index_data?: Record<string, unknown>;
 }
 
+type IndexIssueDetail = {
+  detail_type: string;
+  page_url?: string | null;
+  normalized_page_url?: string | null;
+  product_id?: string | null;
+  source_url?: string | null;
+  reason?: string | null;
+  validation_error?: string | null;
+  database_error?: string | null;
+  metadata?: Record<string, unknown>;
+};
+
 const SAINSBURYS_ERROR_SAMPLE_LIMIT = 50;
 
 export const supermarketAdapters: Record<SupermarketCode, Adapter> = {
@@ -554,7 +566,7 @@ async function expandSainsburysShelfProducts(
   seenProductIds: Set<string>,
   maxProductPages: number | null,
   errors: SupermarketIndexResult["errors"],
-  invalidDetails: Parameters<typeof writeReconciliationDetails>[3],
+  invalidDetails: IndexIssueDetail[],
 ): Promise<IndexedPageCandidate[]> {
   const productPages: IndexedPageCandidate[] = [];
   let flushedProductPages = 0;
@@ -895,58 +907,27 @@ async function countDatabasePages(supabase: SupabaseClient, code: SupermarketCod
   return count ?? 0;
 }
 
-async function loadDatabasePages(supabase: SupabaseClient, code: SupermarketCode) {
-  const rows: Array<{ page_url: string; product_id: string | null; page_type: string | null }> = [];
-  for (let from = 0; ; from += 1000) {
-    const { data, error } = await supabase
-      .from("supermarket_page_index")
-      .select("page_url,product_id,page_type")
-      .eq("supermarket_code", code)
-      .order("page_url", { ascending: true })
-      .range(from, from + 999);
-    if (error) throw new Error(formatSupabaseError(error));
-    rows.push(...((data ?? []) as Array<{ page_url: string; product_id: string | null; page_type: string | null }>));
-    if (!data || data.length < 1000) break;
-  }
-  return rows;
-}
-
-async function writeReconciliationDetails(
+async function countSavedSourcePages(
   supabase: SupabaseClient,
-  runId: string,
   code: SupermarketCode,
-  details: Array<{
-    detail_type: string;
-    page_url?: string | null;
-    normalized_page_url?: string | null;
-    product_id?: string | null;
-    source_url?: string | null;
-    reason?: string | null;
-    validation_error?: string | null;
-    database_error?: string | null;
-    metadata?: Record<string, unknown>;
-  }>,
+  pages: IndexedPageCandidate[],
 ) {
-  if (details.length === 0) return;
-  for (let index = 0; index < details.length; index += 500) {
-    const batch = details.slice(index, index + 500).map((detail) => ({
-      run_id: runId,
-      supermarket_code: code,
-      detail_type: detail.detail_type,
-      page_url: detail.page_url ?? null,
-      normalized_page_url: detail.normalized_page_url ?? null,
-      product_id: detail.product_id ?? null,
-      source_url: detail.source_url ?? null,
-      reason: detail.reason ?? null,
-      validation_error: detail.validation_error ?? null,
-      database_error: detail.database_error ?? null,
-      metadata: detail.metadata ?? {},
-    }));
-    const { error } = await supabase
-      .from("supermarket_index_reconciliation_details")
-      .insert(batch);
+  if (pages.length === 0) return 0;
+
+  let saved = 0;
+  const uniqueUrls = [...new Set(pages.map((page) => page.page_url))];
+  for (let index = 0; index < uniqueUrls.length; index += 500) {
+    const chunk = uniqueUrls.slice(index, index + 500);
+    const { count, error } = await supabase
+      .from("supermarket_page_index")
+      .select("id", { count: "exact", head: true })
+      .eq("supermarket_code", code)
+      .in("page_url", chunk);
     if (error) throw new Error(formatSupabaseError(error));
+    saved += count ?? 0;
   }
+
+  return saved;
 }
 
 export function getSupermarketAdapter(code: unknown): Adapter | null {
@@ -1026,7 +1007,7 @@ export async function indexSupermarketPages(
   const seenPages = new Set<string>();
   const pages: IndexedPageCandidate[] = [];
   const errors: SupermarketIndexResult["errors"] = [];
-  const invalidDetails: Parameters<typeof writeReconciliationDetails>[3] = [];
+  const invalidDetails: IndexIssueDetail[] = [];
   let sourceUrlsDiscovered = 0;
   let duplicateUrlsCount = 0;
   let sitemapUrlsProcessed = 0;
@@ -1133,21 +1114,7 @@ export async function indexSupermarketPages(
     }
   }
 
-  const existingRowsBefore = await loadDatabasePages(supabase, adapter.code);
-  const existingUrlSet = new Set(
-    existingRowsBefore
-      .map((row) => normalizeProductUrl(row.page_url, adapter.defaultSitemapUrls[0] ?? "https://example.com"))
-      .filter((url): url is string => Boolean(url)),
-  );
-  for (const url of existingUrlSet) {
-    seenPages.add(url);
-  }
-  const seenProductIds = new Set(
-    existingRowsBefore
-      .map((row) => row.product_id)
-      .filter((productId): productId is string => Boolean(productId)),
-  );
-  const existingProductPageCount = existingRowsBefore.filter((row) => row.page_type === "product").length;
+  const seenProductIds = new Set<string>();
 
   if (adapter.code === "sainsburys" && pages.length > 0) {
     const shelfPages = pages.filter((page) => page.page_type === "category");
@@ -1172,13 +1139,8 @@ export async function indexSupermarketPages(
   }
 
   const sourceExhausted = queue.length === 0 && !limitReached && errors.length === 0 && seenSitemaps.size < 5000;
-  const effectiveSainsburysProductPageCount =
-    adapter.code === "sainsburys" ? existingProductPageCount + (sainsburysProductPageCount ?? 0) : null;
-  const sourceControlTotal =
-    adapter.code === "sainsburys" && effectiveSainsburysProductPageCount !== null
-      ? pages.filter((page) => page.page_type === "category").length + effectiveSainsburysProductPageCount
-      : pages.length;
-  const existingUrlsCount = pages.filter((page) => existingUrlSet.has(page.normalized_page_url)).length;
+  const sourceControlTotal = pages.length;
+  const existingUrlsCount = await countSavedSourcePages(supabase, adapter.code, pages);
   const newUrlsInserted = pages.length - existingUrlsCount;
   const urlsUpdated = existingUrlsCount;
 
@@ -1186,9 +1148,10 @@ export async function indexSupermarketPages(
   const written = writtenResult.written;
   const writtenProductPages = writtenResult.productPages;
 
-  const databaseRowsAfter = await loadDatabasePages(supabase, adapter.code);
-  const databaseTotalAfter = databaseRowsAfter.length;
-  const databaseProductRowsAfter = databaseRowsAfter.filter((row) => row.page_type === "product").length;
+  const databaseTotalAfter = await countDatabasePages(supabase, adapter.code);
+  const databaseProductRowsAfter = adapter.code === "sainsburys"
+    ? await countSavedSourcePages(supabase, adapter.code, pages.filter((page) => page.page_type === "product"))
+    : writtenProductPages;
   const { data: scopeRows, error: scopeError } = await supabase
     .from("supermarket_page_index")
     .select("scrape_scope")
@@ -1204,49 +1167,20 @@ export async function indexSupermarketPages(
   for (const row of (scopeRows ?? []) as Array<{ scrape_scope: keyof typeof scopeSummary }>) {
     if (row.scrape_scope in scopeSummary) scopeSummary[row.scrape_scope] += 1;
   }
-  const expectedUrlSet = new Set(pages.map((page) => page.normalized_page_url));
-  if (adapter.code === "sainsburys") {
-    for (const url of existingUrlSet) expectedUrlSet.add(url);
-  }
-  const databaseUrlSet = new Set(
-    databaseRowsAfter
-      .map((row) => normalizeProductUrl(row.page_url, adapter.defaultSitemapUrls[0] ?? "https://example.com"))
-      .filter((url): url is string => Boolean(url)),
-  );
-  const missingUrls = pages.filter((page) => !databaseUrlSet.has(page.normalized_page_url));
-  const unexpectedExtras = [...databaseUrlSet].filter((url) => !expectedUrlSet.has(url));
-  const reconciliationDetails: Parameters<typeof writeReconciliationDetails>[3] = [
-    ...invalidDetails,
-    ...missingUrls.slice(0, 5000).map((page) => ({
-      detail_type: "missing_url",
-      page_url: page.page_url,
-      normalized_page_url: page.normalized_page_url,
-      product_id: page.product_id,
-      source_url: page.sitemap_url,
-      reason: "Expected source URL was not present in supermarket_page_index after upsert",
-    })),
-    ...unexpectedExtras.slice(0, 5000).map((url) => ({
-      detail_type: "unexpected_extra_url",
-      page_url: url,
-      normalized_page_url: url,
-      reason: "Database URL was not present in latest source traversal; retained for review",
-    })),
-  ];
-  await writeReconciliationDetails(supabase, runId, adapter.code, reconciliationDetails);
+  const savedSourceUrlsCount = await countSavedSourcePages(supabase, adapter.code, pages);
+  const missingSourceUrlsCount = Math.max(0, sourceControlTotal - savedSourceUrlsCount);
 
-  let reconciliationStatus = "reconciled";
+  let reconciliationStatus = "source_saved";
   let status = "indexed";
-  let phase = "page_index_reconciled";
+  let phase = "page_index_saved";
   let isPartial = false;
   let partialReason: string | null = null;
   let message =
-    adapter.code === "sainsburys"
-      ? `${adapter.name} shelf-to-product source reconciled: ${effectiveSainsburysProductPageCount ?? 0} product URL(s), ${databaseTotalAfter} indexed URL(s)`
-      : `${adapter.name} source reconciled: ${sourceControlTotal} source URL(s), ${databaseTotalAfter} indexed URL(s)`;
+    `${adapter.name} source saved: ${savedSourceUrlsCount} of ${sourceControlTotal} source URL(s) exist in supermarket_page_index`;
 
   if (
     pages.length === 0 ||
-    (adapter.code === "sainsburys" && (effectiveSainsburysProductPageCount ?? 0) === 0)
+    (adapter.code === "sainsburys" && pages.filter((page) => page.page_type === "product").length === 0)
   ) {
     status = "failed";
     phase = "page_index_failed";
@@ -1271,14 +1205,14 @@ export async function indexSupermarketPages(
     isPartial = true;
     partialReason = errors[0]?.error_message ?? "Source traversal did not exhaust all sitemap URLs";
     message = `${adapter.name} indexing is partial because one or more source segments failed`;
-  } else if (missingUrls.length > 0) {
+  } else if (missingSourceUrlsCount > 0) {
     status = "failed";
-    phase = "page_index_reconciliation_failed";
-    reconciliationStatus = "control_total_mismatch";
-    message = `${adapter.name} reconciliation mismatch: ${missingUrls.length} expected URL(s) missing`;
+    phase = "page_index_save_mismatch";
+    reconciliationStatus = "source_save_mismatch";
+    message = `${adapter.name} save mismatch: ${missingSourceUrlsCount} source URL(s) were not present after upsert`;
   } else if (invalidDetails.length > 0) {
-    reconciliationStatus = "reconciled_with_exclusions";
-    message = `${adapter.name} source reconciled with ${invalidDetails.length} invalid URL exclusion(s)`;
+    reconciliationStatus = "source_saved_with_exclusions";
+    message = `${adapter.name} source saved with ${invalidDetails.length} invalid URL exclusion(s)`;
   }
 
   await updateRun(supabase, runId, {
@@ -1291,10 +1225,7 @@ export async function indexSupermarketPages(
     sitemap_count_expected: seenSitemaps.size + queue.length,
     sitemap_count_processed: sitemapUrlsProcessed,
     source_urls_discovered: sourceUrlsDiscovered,
-    unique_urls_discovered:
-      adapter.code === "sainsburys" && effectiveSainsburysProductPageCount !== null
-        ? effectiveSainsburysProductPageCount
-        : pages.length,
+    unique_urls_discovered: pages.length,
     existing_urls_count: existingUrlsCount,
     new_urls_inserted: newUrlsInserted,
     urls_updated: urlsUpdated,
@@ -1304,8 +1235,8 @@ export async function indexSupermarketPages(
     failed_urls_count: errors.length,
     database_total_before: databaseTotalBefore,
     database_total_after: databaseTotalAfter,
-    missing_url_count: missingUrls.length,
-    unexpected_extra_count: unexpectedExtras.length,
+    missing_url_count: missingSourceUrlsCount,
+    unexpected_extra_count: 0,
     reconciliation_status: reconciliationStatus,
     reconciliation_message: message,
     source_exhausted: sourceExhausted,
@@ -1316,11 +1247,11 @@ export async function indexSupermarketPages(
       pending_sitemap_urls: queue,
       urls_discovered_so_far: pages.length,
       sainsburys_product_urls_discovered: sainsburysProductPageCount,
-      sainsburys_effective_product_urls: effectiveSainsburysProductPageCount,
+      source_urls_saved: savedSourceUrlsCount,
       scrape_scope_summary: scopeSummary,
       scrape_scope_classifier_version: SCRAPE_SCOPE_CLASSIFIER_VERSION,
       failed_source_segments: compactErrors(errors),
-      details_limited_to: 5000,
+      reconciliation_detail_logging: "disabled",
     },
     errors_count: errors.length,
     last_message: message,
@@ -1329,22 +1260,16 @@ export async function indexSupermarketPages(
   });
 
   return {
-    success: adapter.code === "sainsburys" ? (effectiveSainsburysProductPageCount ?? 0) > 0 : pages.length > 0,
+    success: pages.length > 0 && missingSourceUrlsCount === 0,
     supermarket_code: adapter.code,
     supermarket_name: adapter.name,
     run_id: runId,
-    pages_found:
-      adapter.code === "sainsburys" && effectiveSainsburysProductPageCount !== null
-        ? effectiveSainsburysProductPageCount
-        : pages.length,
+    pages_found: pages.length,
     pages_inserted_or_updated: written,
     sitemap_urls_processed: sitemapUrlsProcessed,
     errors,
     source_control_total: sourceControlTotal,
-    unique_urls_discovered:
-      adapter.code === "sainsburys" && effectiveSainsburysProductPageCount !== null
-        ? effectiveSainsburysProductPageCount
-        : pages.length,
+    unique_urls_discovered: pages.length,
     database_total_before: databaseTotalBefore,
     database_total_after: databaseTotalAfter,
     existing_urls_count: existingUrlsCount,
@@ -1352,8 +1277,8 @@ export async function indexSupermarketPages(
     urls_updated: urlsUpdated,
     duplicate_urls_count: duplicateUrlsCount,
     invalid_urls_count: invalidDetails.length,
-    missing_url_count: missingUrls.length,
-    unexpected_extra_count: unexpectedExtras.length,
+    missing_url_count: missingSourceUrlsCount,
+    unexpected_extra_count: 0,
     reconciliation_status: reconciliationStatus,
     message,
   };

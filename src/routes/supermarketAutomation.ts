@@ -76,7 +76,7 @@ supermarketAutomationRouter.post(
           supermarket_name: adapter.name,
           run_id: runId,
           detached: true,
-          message: `${adapter.name} sitemap indexer accepted; poll Supabase run status for reconciliation.`,
+          message: `${adapter.name} sitemap indexer accepted; poll Supabase run status for source URL save totals.`,
         });
         return;
       }
