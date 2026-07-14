@@ -41,7 +41,12 @@ supermarketAutomationRouter.post(
         }
 
         void indexSupermarketPages(adapter.code as SupermarketCode, body).catch(async (error) => {
-          const message = error instanceof Error ? error.message : String(error);
+          const message =
+            error instanceof Error
+              ? error.message || error.stack || error.name
+              : typeof error === "string" && error.trim()
+                ? error
+                : JSON.stringify(error ?? "Detached indexer failed without an error payload");
           console.error("[supermarketAutomation] Detached sitemap indexer failed", {
             supermarket_code: adapter.code,
             run_id: runId,

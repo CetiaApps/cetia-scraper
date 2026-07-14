@@ -316,17 +316,6 @@ async function upsertIndexedPages(
       .upsert(batch, { onConflict: "supermarket_code,page_url" });
     if (error) throw new Error(formatSupabaseError(error));
 
-    try {
-      await classifyIndexedPageBatch(supabase, adapter, batchPages);
-    } catch (error) {
-      console.warn("[supermarketIndexer] Page scope classification failed for batch", {
-        supermarket_code: adapter.code,
-        run_id: runId,
-        batch_size: batchPages.length,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-
     written += batch.length;
     productPages += batchPages.filter((page) => page.page_type === "product").length;
   }
@@ -795,11 +784,27 @@ async function fetchSourceViaBrightData(url: string, adapter: Adapter) {
 }
 
 async function fetchSourceText(url: string, adapter: Adapter) {
-  const response = await fetch(url, {
-    headers: BROWSER_HEADERS,
-    signal: AbortSignal.timeout(45_000),
-  });
-  const text = await response.text();
+  let response: Response;
+  let text = "";
+  try {
+    response = await fetch(url, {
+      headers: BROWSER_HEADERS,
+      signal: AbortSignal.timeout(45_000),
+    });
+    text = await response.text();
+  } catch (error) {
+    const bright = await fetchSourceViaBrightData(url, adapter);
+    if (bright) return bright;
+    return {
+      ok: false,
+      status: 0,
+      text: "",
+      fetchMethod: "direct_exception",
+      contentType: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
   if (response.ok) {
     if (isLikelySitemap(url) && !/<loc\b/i.test(text)) {
       const bright = await fetchSourceViaBrightData(url, adapter);
@@ -1013,6 +1018,30 @@ export async function indexSupermarketPages(
   let sitemapUrlsProcessed = 0;
   let limitReached = false;
   let sainsburysProductPageCount: number | null = null;
+  let flushedPages = 0;
+  let writtenDuringTraversal = 0;
+  let productPagesWrittenDuringTraversal = 0;
+
+  const flushGenericPages = async (force = false) => {
+    if (adapter.code === "sainsburys") return;
+    const pendingCount = pages.length - flushedPages;
+    if (pendingCount <= 0 || (!force && pendingCount < 5000)) return;
+    const pendingPages = pages.slice(flushedPages);
+    const writtenResult = await upsertIndexedPages(supabase, adapter, runId, pendingPages);
+    flushedPages = pages.length;
+    writtenDuringTraversal += writtenResult.written;
+    productPagesWrittenDuringTraversal += writtenResult.productPages;
+    await updateRun(supabase, runId, {
+      pages_indexed: writtenDuringTraversal,
+      pages_pending: productPagesWrittenDuringTraversal,
+      source_urls_discovered: sourceUrlsDiscovered,
+      unique_urls_discovered: pages.length,
+      duplicate_urls_count: duplicateUrlsCount,
+      invalid_urls_count: invalidDetails.length,
+      sitemap_count_processed: sitemapUrlsProcessed,
+      last_message: `${adapter.name} checkpoint saved ${writtenDuringTraversal} of ${pages.length} discovered page URL(s)`,
+    });
+  };
 
   while (queue.length > 0 && seenSitemaps.size < 5000) {
     const sitemapUrl = queue.shift()!;
@@ -1028,7 +1057,10 @@ export async function indexSupermarketPages(
           url: sitemapUrl,
           http_status: source.status,
           error_code: "SUPERMARKET_SITEMAP_FETCH_FAILED",
-          error_message: `${adapter.name} sitemap fetch failed with HTTP ${source.status}`,
+          error_message:
+            "error" in source && source.error
+              ? `${adapter.name} sitemap fetch failed via ${source.fetchMethod}: ${source.error}`
+              : `${adapter.name} sitemap fetch failed with HTTP ${source.status}`,
         };
         errors.push(item);
         await logIndexError(supabase, adapter, runId, item);
@@ -1075,6 +1107,7 @@ export async function indexSupermarketPages(
               limitReached = true;
               break;
             }
+            await flushGenericPages(false);
           } else {
             duplicateUrlsCount += 1;
           }
@@ -1144,9 +1177,14 @@ export async function indexSupermarketPages(
   const newUrlsInserted = pages.length - existingUrlsCount;
   const urlsUpdated = existingUrlsCount;
 
-  const writtenResult = await upsertIndexedPages(supabase, adapter, runId, pages);
-  const written = writtenResult.written;
-  const writtenProductPages = writtenResult.productPages;
+  await flushGenericPages(true);
+  let written = writtenDuringTraversal;
+  let writtenProductPages = productPagesWrittenDuringTraversal;
+  if (adapter.code === "sainsburys") {
+    const writtenResult = await upsertIndexedPages(supabase, adapter, runId, pages);
+    written = writtenResult.written;
+    writtenProductPages = writtenResult.productPages;
+  }
 
   const databaseTotalAfter = await countDatabasePages(supabase, adapter.code);
   const databaseProductRowsAfter = adapter.code === "sainsburys"
