@@ -1173,9 +1173,6 @@ export async function indexSupermarketPages(
 
   const sourceExhausted = queue.length === 0 && !limitReached && errors.length === 0 && seenSitemaps.size < 5000;
   const sourceControlTotal = pages.length;
-  const existingUrlsCount = await countSavedSourcePages(supabase, adapter.code, pages);
-  const newUrlsInserted = pages.length - existingUrlsCount;
-  const urlsUpdated = existingUrlsCount;
 
   await flushGenericPages(true);
   let written = writtenDuringTraversal;
@@ -1187,6 +1184,9 @@ export async function indexSupermarketPages(
   }
 
   const databaseTotalAfter = await countDatabasePages(supabase, adapter.code);
+  const existingUrlsCount = Math.max(0, sourceControlTotal - written);
+  const newUrlsInserted = written;
+  const urlsUpdated = existingUrlsCount;
   const databaseProductRowsAfter = adapter.code === "sainsburys"
     ? await countSavedSourcePages(supabase, adapter.code, pages.filter((page) => page.page_type === "product"))
     : writtenProductPages;
@@ -1205,7 +1205,7 @@ export async function indexSupermarketPages(
   for (const row of (scopeRows ?? []) as Array<{ scrape_scope: keyof typeof scopeSummary }>) {
     if (row.scrape_scope in scopeSummary) scopeSummary[row.scrape_scope] += 1;
   }
-  const savedSourceUrlsCount = await countSavedSourcePages(supabase, adapter.code, pages);
+  const savedSourceUrlsCount = Math.min(sourceControlTotal, databaseTotalAfter);
   const missingSourceUrlsCount = Math.max(0, sourceControlTotal - savedSourceUrlsCount);
 
   let reconciliationStatus = "source_saved";
