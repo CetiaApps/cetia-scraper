@@ -488,12 +488,15 @@ async function claimPages(
     .from("supermarket_page_index")
     .select("id,run_id,page_url,product_id,scrape_attempt_count,max_attempts")
     .eq("supermarket_code", SUPERMARKET_CODE)
-    .eq("scrape_scope", "eligible")
     .eq("permanent_failure", false)
     .in("scrape_status", options.includeFailed ? ["pending", "failed"] : ["pending"])
     .or(`next_scrape_after.is.null,next_scrape_after.lte.${now}`)
     .order("updated_at", { ascending: true })
     .limit(batchSize * 5);
+
+  if (!options.onlyRecoverableFailed) {
+    query = query.eq("scrape_scope", "eligible");
+  }
 
   if (options.excludeDeadPages) {
     query = query.or("page_outcome.is.null,page_outcome.neq.dead_product_page");
