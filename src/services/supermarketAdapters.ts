@@ -311,9 +311,14 @@ async function upsertIndexedPages(
       },
       updated_at: new Date().toISOString(),
     }));
+    const conflictTarget =
+      adapter.code === "sainsburys" &&
+      batchPages.every((page) => page.page_type === "product" && page.product_id)
+        ? "supermarket_code,product_id"
+        : "supermarket_code,page_url";
     const { error } = await supabase
       .from("supermarket_page_index")
-      .upsert(batch, { onConflict: "supermarket_code,page_url" });
+      .upsert(batch, { onConflict: conflictTarget });
     if (error) throw new Error(formatSupabaseError(error));
 
     written += batch.length;
