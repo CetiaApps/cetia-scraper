@@ -566,6 +566,22 @@ async function expandSainsburysShelfProducts(
   let failedShelves = 0;
   let loggedShelfErrors = 0;
 
+  function sainsburysCheckpointMetadata() {
+    return {
+      sainsburys_shelves_processed: shelvesProcessed,
+      sainsburys_shelves_total: shelfPages.length,
+      sainsburys_shelves_remaining: Math.max(0, shelfPages.length - shelvesProcessed),
+      sainsburys_current_shelf_url: shelfPages[Math.max(0, Math.min(shelvesProcessed - 1, shelfPages.length - 1))]?.page_url ?? null,
+      sainsburys_shelves_with_products: shelvesWithProducts,
+      sainsburys_product_urls_discovered: productPages.length,
+      sainsburys_product_urls_saved: flushedProductPages,
+      sainsburys_duplicate_product_urls: duplicateProducts,
+      sainsburys_invalid_product_rows: invalidProducts,
+      sainsburys_failed_shelf_count: failedShelves,
+      failed_source_segments: compactErrors(errors),
+    };
+  }
+
   for (const shelf of shelfPages) {
     if (maxProductPages !== null && productPages.length >= maxProductPages) break;
     const categoryId = sainsburysCategoryIdFromUrl(shelf.page_url);
@@ -657,7 +673,13 @@ async function expandSainsburysShelfProducts(
       flushedProductPages = productPages.length;
       await updateRun(supabase, runId, {
         pages_pending: flushedProductPages,
-        last_message: `Sainsbury's checkpoint wrote ${flushedProductPages} product URL(s) while expanding shelves`,
+        source_control_total: shelfPages.length,
+        source_urls_discovered: shelfPages.length + productPages.length,
+        unique_urls_discovered: shelfPages.length + productPages.length,
+        duplicate_urls_count: duplicateProducts,
+        invalid_urls_count: invalidDetails.length,
+        checkpoint_metadata: sainsburysCheckpointMetadata(),
+        last_message: `Sainsbury's checkpoint wrote ${flushedProductPages} product URL(s); expanded ${shelvesProcessed}/${shelfPages.length} shelf URL(s)`,
       });
     }
 
@@ -668,16 +690,8 @@ async function expandSainsburysShelfProducts(
         unique_urls_discovered: shelfPages.length + productPages.length,
         duplicate_urls_count: duplicateProducts,
         invalid_urls_count: invalidDetails.length,
-        checkpoint_metadata: {
-          sainsburys_shelves_processed: shelvesProcessed,
-          sainsburys_shelves_total: shelfPages.length,
-          sainsburys_shelves_with_products: shelvesWithProducts,
-          sainsburys_product_urls_discovered: productPages.length,
-          sainsburys_duplicate_product_urls: duplicateProducts,
-          sainsburys_invalid_product_rows: invalidProducts,
-          sainsburys_failed_shelf_count: failedShelves,
-          failed_source_segments: compactErrors(errors),
-        },
+        source_control_total: shelfPages.length,
+        checkpoint_metadata: sainsburysCheckpointMetadata(),
         last_message: `Sainsbury's expanded ${shelvesProcessed}/${shelfPages.length} shelf URL(s), found ${productPages.length} product page URL(s)`,
       });
     }
@@ -689,16 +703,8 @@ async function expandSainsburysShelfProducts(
   }
 
   await updateRun(supabase, runId, {
-    checkpoint_metadata: {
-      sainsburys_shelves_processed: shelvesProcessed,
-      sainsburys_shelves_total: shelfPages.length,
-      sainsburys_shelves_with_products: shelvesWithProducts,
-      sainsburys_product_urls_discovered: productPages.length,
-      sainsburys_duplicate_product_urls: duplicateProducts,
-      sainsburys_invalid_product_rows: invalidProducts,
-      sainsburys_failed_shelf_count: failedShelves,
-      failed_source_segments: compactErrors(errors),
-    },
+    source_control_total: shelfPages.length,
+    checkpoint_metadata: sainsburysCheckpointMetadata(),
     last_message: `Sainsbury's shelf-to-product expansion found ${productPages.length} product page URL(s) from ${shelvesProcessed} shelf URL(s)`,
   });
 
