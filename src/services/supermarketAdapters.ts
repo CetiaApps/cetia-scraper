@@ -946,6 +946,16 @@ async function countDatabasePages(supabase: SupabaseClient, code: SupermarketCod
   return count ?? 0;
 }
 
+async function countDatabaseProductPages(supabase: SupabaseClient, code: SupermarketCode) {
+  const { count, error } = await supabase
+    .from("supermarket_page_index")
+    .select("id", { count: "exact", head: true })
+    .eq("supermarket_code", code)
+    .eq("page_type", "product");
+  if (error) throw new Error(formatSupabaseError(error));
+  return count ?? 0;
+}
+
 async function countSavedSourcePages(
   supabase: SupabaseClient,
   code: SupermarketCode,
@@ -1222,7 +1232,7 @@ export async function indexSupermarketPages(
   const newUrlsInserted = written;
   const urlsUpdated = existingUrlsCount;
   const databaseProductRowsAfter = adapter.code === "sainsburys"
-    ? await countSavedSourcePages(supabase, adapter.code, pages.filter((page) => page.page_type === "product"))
+    ? await countDatabaseProductPages(supabase, adapter.code)
     : writtenProductPages;
   const { data: scopeRows, error: scopeError } = await supabase
     .from("supermarket_page_index")
