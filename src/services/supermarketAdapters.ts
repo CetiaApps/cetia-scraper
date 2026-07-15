@@ -292,7 +292,35 @@ async function upsertIndexedPages(
   let written = 0;
   let productPages = 0;
   for (let index = 0; index < pages.length; index += 500) {
-    const batchPages = pages.slice(index, index + 500);
+    let batchPages = pages.slice(index, index + 500);
+    if (adapter.code === "sainsburys") {
+      const productIds = [
+        ...new Set(
+          batchPages
+            .filter((page) => page.page_type === "product" && page.product_id)
+            .map((page) => String(page.product_id)),
+        ),
+      ];
+      if (productIds.length > 0) {
+        const { data, error } = await supabase
+          .from("supermarket_page_index")
+          .select("product_id,page_url")
+          .eq("supermarket_code", adapter.code)
+          .in("product_id", productIds);
+        if (error) throw new Error(formatSupabaseError(error));
+        const existingByProductId = new Map(
+          (data ?? [])
+            .filter((row) => typeof row.product_id === "string" && typeof row.page_url === "string")
+            .map((row) => [String(row.product_id), String(row.page_url)]),
+        );
+        batchPages = batchPages.filter((page) => {
+          if (page.page_type !== "product" || !page.product_id) return true;
+          const existingUrl = existingByProductId.get(String(page.product_id));
+          return !existingUrl || existingUrl === page.page_url;
+        });
+      }
+    }
+    if (batchPages.length === 0) continue;
     const batch = batchPages.map((page) => ({
       run_id: runId,
       supermarket_code: adapter.code,
@@ -311,14 +339,9 @@ async function upsertIndexedPages(
       },
       updated_at: new Date().toISOString(),
     }));
-    const conflictTarget =
-      adapter.code === "sainsburys" &&
-      batchPages.every((page) => page.page_type === "product" && page.product_id)
-        ? "supermarket_code,product_id"
-        : "supermarket_code,page_url";
     const { error } = await supabase
       .from("supermarket_page_index")
-      .upsert(batch, { onConflict: conflictTarget });
+      .upsert(batch, { onConflict: "supermarket_code,page_url" });
     if (error) throw new Error(formatSupabaseError(error));
 
     written += batch.length;
