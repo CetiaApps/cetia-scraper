@@ -483,60 +483,16 @@ async function claimPages(
     return (data ?? []) as WorkerPage[];
   }
 
-  const now = new Date().toISOString();
-  let query = supabase
-    .from("supermarket_page_index")
-    .select("id,run_id,page_url,product_id,scrape_attempt_count,max_attempts")
-    .eq("supermarket_code", SUPERMARKET_CODE)
-    .eq("scrape_scope", "eligible")
-    .or("permanent_failure.is.null,permanent_failure.eq.false")
-    .in("scrape_status", options.includeFailed ? ["pending", "failed"] : ["pending"])
-    .or(`next_scrape_after.is.null,next_scrape_after.lte.${now}`)
-    .order("updated_at", { ascending: true })
-    .limit(batchSize * 5);
-
-  if (options.excludeDeadPages) {
-    query = query.or("page_outcome.is.null,page_outcome.neq.dead_product_page");
-  }
-
-  if (options.onlyRecoverableFailed) {
-    query = query.in("page_outcome", [
-      "brightdata_empty_html",
-      "network_error",
-      "blocked_or_consent",
-      "parse_error",
-      "unknown_failure",
-    ]);
-  }
-
-  const { data, error } = await query;
-
+  const { data, error } = await supabase.rpc("claim_tesco_global_product_pages", {
+    p_run_id: runId,
+    p_batch_size: batchSize,
+    p_worker_id: workerId,
+    p_include_failed: options.includeFailed,
+    p_only_recoverable_failed: options.onlyRecoverableFailed,
+    p_exclude_dead_pages: options.excludeDeadPages,
+  });
   if (error) throw new Error(error.message);
-
-  const pages = ((data ?? []) as WorkerPage[])
-    .filter(eligibleForScrape)
-    .slice(0, batchSize);
-
-  if (pages.length === 0) return [];
-
-  const { data: claimed, error: claimError } = await supabase
-    .from("supermarket_page_index")
-    .update({
-      run_id: runId,
-      scrape_status: "scraping",
-      claimed_at: new Date().toISOString(),
-      claimed_by: workerId,
-      last_error: null,
-      updated_at: new Date().toISOString(),
-    })
-    .in(
-      "id",
-      pages.map((page) => page.id),
-    )
-    .select("id,run_id,page_url,product_id,scrape_attempt_count,max_attempts");
-
-  if (claimError) throw new Error(claimError.message);
-  return (claimed ?? []) as WorkerPage[];
+  return ((data ?? []) as WorkerPage[]).filter(eligibleForScrape).slice(0, batchSize);
 }
 
 async function markPageFailed(
@@ -933,6 +889,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
   let effectiveMaxConcurrency = maxConcurrency;
   let adaptiveThrottleEvents = 0;
   let latestAdaptiveWindow: CircuitBreakerWindow | null = null;
+  let currentStage = "initialising";
   const stats = emptyStats();
   const circuitBreakerSamples: CircuitBreakerSample[] = [];
   const workerConfig = {
@@ -974,6 +931,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     worker_config: workerConfig,
   });
 
+  currentStage = "load_run";
   const { data: run, error: runError } = await supabase
     .from("supermarket_price_scrape_runs")
     .select("id,status,items_written_to_productscrapped,config")
@@ -981,11 +939,14 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     .single();
   if (runError || !run) throw new Error(runError?.message ?? "Run not found");
 
+  currentStage = "reset_stale_pages_before_start";
   await resetStalePages(supabase, runId, adoptGlobalPendingPages);
+  currentStage = "count_active_workers";
   const activeWorkers = await activeWorkerCount(supabase, runId, adoptGlobalPendingPages);
   if (activeWorkers >= maxActiveWorkers && !force) {
     throw new WorkerAlreadyRunningError(activeWorkers, maxActiveWorkers);
   }
+  currentStage = "count_active_claims";
   const activePages = await activeClaimCount(supabase, runId, adoptGlobalPendingPages);
   if (activePages > 0 && force) {
     recoveredActivePages = await resetActivePages(supabase, runId);
@@ -996,6 +957,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     });
   }
 
+  currentStage = "mark_run_started";
   await supabase
     .from("supermarket_price_scrape_runs")
     .update({
@@ -1017,6 +979,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
   try {
     while (Date.now() < deadline) {
       if (deadline - Date.now() < 1000) break;
+      currentStage = "load_fresh_run_status";
       const { data: freshRun, error } = await supabase
         .from("supermarket_price_scrape_runs")
         .select("status")
@@ -1028,13 +991,16 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
         break;
       }
 
+      currentStage = "reset_stale_pages_loop";
       await resetStalePages(supabase, runId, adoptGlobalPendingPages);
+      currentStage = "claim_run_pages";
       let pages = await claimPages(supabase, runId, workerId, batchSize, "run", {
         includeFailed,
         onlyRecoverableFailed,
         excludeDeadPages,
       });
       if (pages.length === 0 && adoptGlobalPendingPages) {
+        currentStage = "claim_global_pages";
         pages = await claimPages(supabase, runId, workerId, batchSize, "global", {
           includeFailed,
           onlyRecoverableFailed,
@@ -1063,6 +1029,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
 
       loops++;
       pagesClaimed += pages.length;
+      currentStage = "refresh_counts_after_claim";
       const claimCounts = await refreshRunCounts(supabase, runId, {
         last_message: `Railway worker batch ${loops}: ${pages.length} page(s) claimed`,
         last_error: null,
@@ -1079,6 +1046,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
 
       let batch: Awaited<ReturnType<typeof processBatch>>;
       try {
+        currentStage = "process_batch";
         batch = await processBatch(
           supabase,
           runId,
@@ -1114,6 +1082,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
       });
 
       const existingProductScrappedWrites = Number(run.items_written_to_productscrapped ?? 0);
+      currentStage = "refresh_counts_after_batch";
       const counts = await refreshRunCounts(supabase, runId, {
         items_written_to_productscrapped:
           existingProductScrappedWrites + productscrappedWritten,
@@ -1255,7 +1224,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     }
   } catch (error) {
     stoppedReason = "error";
-    lastError = safeErrorMessage(error);
+    lastError = `${currentStage}: ${safeErrorMessage(error)}`;
     await logScrapeError(supabase, {
       runId,
       phase: "railway_worker",
