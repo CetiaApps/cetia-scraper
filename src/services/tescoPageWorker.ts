@@ -489,7 +489,7 @@ async function claimPages(
     .select("id,run_id,page_url,product_id,scrape_attempt_count,max_attempts")
     .eq("supermarket_code", SUPERMARKET_CODE)
     .eq("scrape_scope", "eligible")
-    .eq("permanent_failure", false)
+    .or("permanent_failure.is.null,permanent_failure.eq.false")
     .in("scrape_status", options.includeFailed ? ["pending", "failed"] : ["pending"])
     .or(`next_scrape_after.is.null,next_scrape_after.lte.${now}`)
     .order("updated_at", { ascending: true })
