@@ -15,6 +15,7 @@ export type BrightDataFetchMode =
   | "render_only";
 
 export interface BrightDataFetchOptions {
+  apiKey?: string;
   render?: boolean;
   timeoutMs?: number;
   rawTimeoutMs?: number;
@@ -106,7 +107,7 @@ export async function fetchTescoHtmlViaBrightData(
   url: string,
   options: BrightDataFetchOptions = {},
 ): Promise<BrightDataFetchResult> {
-  const apiKey = getRequiredEnv("BRIGHTDATA_API_KEY");
+  const apiKey = options.apiKey || getRequiredEnv("BRIGHTDATA_API_KEY");
   const zone = process.env.BRIGHTDATA_ZONE || "cetiadataservice";
   const render = options.render === true;
   const rawTimeoutMs = Math.min(

@@ -55,6 +55,7 @@ export interface TescoWorkerInput {
   raw_timeout_ms?: unknown;
   empty_html_retry_count?: unknown;
   empty_html_retry_delay_ms?: unknown;
+  brightdata_api_key?: unknown;
   force?: unknown;
   debug?: unknown;
 }
@@ -586,6 +587,7 @@ async function processBatch(
     emptyHtmlRetryCount: number;
     emptyHtmlRetryDelayMs: number;
   },
+  brightdataApiKey?: string,
 ) {
   const startedAt = Date.now();
   const scrapeInputs: TescoProductPageInput[] = pages.map((page) => ({
@@ -606,6 +608,7 @@ async function processBatch(
     renderWaitMs: fetchSettings.renderWaitMs,
     emptyHtmlRetryCount: fetchSettings.emptyHtmlRetryCount,
     emptyHtmlRetryDelayMs: fetchSettings.emptyHtmlRetryDelayMs,
+    brightdataApiKey,
   });
   const pagesByUrl = new Map(pages.map((page) => [page.page_url, page]));
   const errorsByUrl = new Map(scrapeResult.errors.map((error) => [error.product_url, error]));
@@ -866,6 +869,10 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
   const onlyRecoverableFailed = boolValue(input.only_recoverable_failed, recoveryPass);
   const excludeDeadPages = boolValue(input.exclude_dead_pages, true);
   const maxActiveWorkers = clampInt(input.max_active_workers, fastFirstPass ? 2 : 1, 1, 3);
+  const brightdataApiKey =
+    typeof input.brightdata_api_key === "string" && input.brightdata_api_key.trim()
+      ? input.brightdata_api_key.trim()
+      : undefined;
   const debug = boolValue(input.debug, false);
   const force = input.force === true;
   const workerId = `tesco-railway-worker-${randomUUID()}`;
@@ -901,6 +908,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
     effective_max_concurrency: effectiveMaxConcurrency,
     max_active_workers: maxActiveWorkers,
     allow_render_fallback: allowRenderFallback,
+    brightdata_key_source: brightdataApiKey ? "request_override" : "env",
     batch_size: batchSize,
     include_failed: includeFailed,
     only_recoverable_failed: onlyRecoverableFailed,
@@ -1064,6 +1072,7 @@ export async function runTescoPageWorker(input: TescoWorkerInput): Promise<Tesco
             emptyHtmlRetryCount,
             emptyHtmlRetryDelayMs,
           },
+          brightdataApiKey,
         );
       } catch (error) {
         await releaseClaimedPagesAfterBatchError(supabase, runId, pages, error);

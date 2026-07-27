@@ -61,6 +61,8 @@ export interface TescoProductPageError {
 }
 
 export interface TescoProductPageScrapeOptions {
+  brightdataApiKey?: string;
+  brightdata_api_key?: string;
   allowRenderFallback?: boolean;
   allow_render_fallback?: boolean;
   requestTimeoutMs?: number;
@@ -179,6 +181,7 @@ export async function scrapeTescoProductPages(
     emptyHtmlRetryCount: request.emptyHtmlRetryCount ?? request.empty_html_retry_count,
     emptyHtmlRetryDelayMs: request.emptyHtmlRetryDelayMs ?? request.empty_html_retry_delay_ms,
     fetchMode: request.fetchMode ?? request.fetch_mode ?? getTescoProductFetchMode(),
+    brightdataApiKey: request.brightdataApiKey ?? request.brightdata_api_key,
     debug: request.debug === true,
   } as TescoProductPageScrapeOptions & { allow_render_fallback?: boolean };
   const items: TescoProductPageItem[] = [];
@@ -388,6 +391,7 @@ async function fetchTescoProductPage(
   const allowFallback = options.allowRenderFallback ?? options.allow_render_fallback ?? true;
   const firstRender = mode === "render_first" || mode === "render_only";
   const first = await fetchTescoHtmlViaBrightData(page.page_url, {
+    apiKey: options.brightdataApiKey ?? options.brightdata_api_key,
     render: firstRender,
     timeoutMs: firstRender ? options.renderTimeoutMs ?? options.render_timeout_ms ?? options.requestTimeoutMs : options.rawTimeoutMs ?? options.raw_timeout_ms ?? options.requestTimeoutMs,
     rawTimeoutMs: options.rawTimeoutMs ?? options.raw_timeout_ms,
@@ -417,6 +421,7 @@ async function fetchTescoProductPage(
   });
 
   const second = await fetchTescoHtmlViaBrightData(page.page_url, {
+    apiKey: options.brightdataApiKey ?? options.brightdata_api_key,
     render: fallbackRender,
     timeoutMs: fallbackRender ? options.renderTimeoutMs ?? options.render_timeout_ms ?? options.requestTimeoutMs : options.rawTimeoutMs ?? options.raw_timeout_ms ?? options.requestTimeoutMs,
     rawTimeoutMs: options.rawTimeoutMs ?? options.raw_timeout_ms,
